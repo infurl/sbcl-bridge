@@ -130,9 +130,12 @@ lines:
 ```
 
 - **`REQID`** correlates a request with its response. If omitted, the bridge
-  synthesizes one (`auto-<universal-time>-<random>`). `sbcl-client.sh` always
-  supplies one (a nanosecond timestamp, its own PID, and a random
-  component). The response and input
+  synthesizes one (`auto-<universal-time>-<random>`). `sbcl-client.sh`
+  supplies one (a nanosecond timestamp, its own PID, and a random component)
+  — unless the submitted code already carries its own `REQID` header, in
+  which case the client reuses it rather than shadowing it; an embedded
+  `TIMEOUT` header likewise extends the client's wait budget (see §7,
+  "Embedded headers"). The response and input
   log markers always echo the reqid exactly as submitted, but the archive
   *filename* in `processed/` is sanitized to alphanumerics plus `.`/`_`/`-`
   (other characters become `_`, leading dots are stripped, and the name is
@@ -399,7 +402,18 @@ inside a container.
 
 - `start`
   - Cold-starts a fresh SBCL process running `run-bridge`. No-op (with a
-	message) if already running.
+	message) if already running. SBCL is always started with `--no-sysinit
+	--no-userinit`: the bridge must behave identically in a bare container
+	and on a developer desktop, and a stray `/etc/sbclrc` or `~/.sbclrc`
+	that loads Quicklisp, changes `*print-*` settings, or merely prints
+	something would make evaluation results environment-dependent (and
+	could corrupt the marker protocol). Anything an init file would have
+	provided can be loaded explicitly as an ordinary first request instead
+	— which also means it's captured in the input log and, unlike an init
+	file, becomes image state that survives suspend/resume. (`resume`
+	never processes init files either: the saved image's custom toplevel
+	bypasses the startup sequence that would read them, and the version
+	probe used for core-compatibility checks runs with the same flags.)
 
 - `stop`
   - Sends `SIGTERM`, waits up to `SBCL_STOP_TIMEOUT`, escalates to `SIGKILL`
@@ -494,17 +508,23 @@ sbcl-client.sh -                            # read code from stdin
 
 The client:
 
-1. Generates a unique request id (nanosecond timestamp + its own PID + a
-   random component; on non-GNU `date` without `%N` support, the latter two
-   still keep ids unique).
+1. Scans the leading `;;; KEY: value` header comments of the submitted code
+   (any mode — `file`, `eval`, or stdin) with the same parser rules the
+   bridge uses, and honors what it finds: an embedded `;;; REQID:` is
+   **reused** as the request id rather than shadowed by a generated one, and
+   an embedded `;;; TIMEOUT:` feeds into the client's own wait budget (step
+   below). If the code carries no `REQID`, the client generates a unique one
+   (nanosecond timestamp + its own PID + a random component; on non-GNU
+   `date` without `%N` support, the latter two still keep ids unique).
 
-2. Writes the code (with `REQID`/`TIMEOUT` headers) to a temp file, then
-   atomically hard-links it into place. `ln` fails if `next-sbcl-input.lisp`
-   already exists, so a request that's queued but not yet claimed by the
-   bridge is never overwritten — if the slot is busy, the client polls until
-   the bridge claims the queued request (within the overall `SBCL_TIMEOUT`
-   budget), so sequential callers queue up safely instead of clobbering each
-   other.
+2. Writes the code to a temp file — prepending a `REQID` header only when it
+   generated one, and a `TIMEOUT` header only when `SBCL_REQUEST_TIMEOUT` is
+   set — then atomically hard-links it into place. `ln` fails if
+   `next-sbcl-input.lisp` already exists, so a request that's queued but not
+   yet claimed by the bridge is never overwritten — if the slot is busy, the
+   client polls until the bridge claims the queued request (within the
+   overall `SBCL_TIMEOUT` budget), so sequential callers queue up safely
+   instead of clobbering each other.
 
 3. Records the current byte size of `sbcl-output.log` so it only ever scans
    *new* content — cheap even in a long-lived session with a huge log. If the
@@ -518,6 +538,47 @@ The client:
    that follows the id (`id=<reqid> `), so a reqid that happens to be a
    strict prefix of another reqid can never match the wrong request's block.
 
+### Embedded headers: self-describing request files
+
+A request file can carry its own headers, and submitting it through the
+client Just Works — this is the idiomatic way to package a setup script that
+knows its own identity and how long it's allowed to take:
+
+```lisp
+;;; REQID: quicklisp-loader
+;;; TIMEOUT: 45
+
+(in-package #:cl-user)
+#-quicklisp
+(load #P"/usr/share/common-lisp/source/quicklisp/quicklisp.lisp")
+(ql:quickload "alexandria")
+;; ...
+```
+
+```bash
+./sbcl-client.sh file quicklisp-loader.lisp
+# ...
+# ;;; END-OUTPUT id=quicklisp-loader status=ok
+```
+
+The response markers and the `processed/` archive carry `quicklisp-loader`,
+and the client waits up to 50 seconds (45 + 5) rather than abandoning the
+request at its default 30 — previously the bridge would honor the embedded
+`TIMEOUT` while the client, unaware of it, gave up first with exit 2.
+
+Precedence for the evaluation timeout, highest first:
+`SBCL_REQUEST_TIMEOUT` (env) → embedded `;;; TIMEOUT:` header → the bridge's
+default. (The env value wins mechanically: the client prepends it ahead of
+the code, and the bridge honors the first `TIMEOUT` header it sees.)
+`SBCL_TIMEOUT`, when set, still overrides the client's *wait budget*
+unconditionally.
+
+One caveat with a fixed, reused `REQID`: response correlation is unaffected
+(the client only scans log output appended after its own submission), but
+each run's `processed/` archive overwrites the previous one, and log entries
+from different runs share the same id — fine for setup scripts, less ideal
+for requests you want to tell apart later.
+
 ### Environment variables
 
 - `SBCL_BRIDGE_DIR` — default `.`
@@ -526,7 +587,8 @@ The client:
 - `SBCL_POLL_INTERVAL` — default `0.2`
   - Seconds between checks of the output log.
 
-- `SBCL_TIMEOUT` — default larger of `30` or `SBCL_REQUEST_TIMEOUT + 5`
+- `SBCL_TIMEOUT` — default larger of `30` or the effective evaluation
+  timeout + 5 (from `SBCL_REQUEST_TIMEOUT` or an embedded `TIMEOUT` header)
   - Total seconds *this script* waits before giving up — the budget covers
 	both queueing the request (if the input slot is busy) and receiving the
 	response. Setting it to the empty string is the same as leaving it unset.
@@ -1070,6 +1132,11 @@ echo '(+ 1 2)' | ./sbcl-client.sh -
 # Per-request timeout
 SBCL_REQUEST_TIMEOUT=5    ./sbcl-client.sh eval '(sleep 10)'   # -> status=timeout
 SBCL_REQUEST_TIMEOUT=none ./sbcl-client.sh eval '(long-job)'   # no timeout
+
+# Embedded headers in a submitted file are honored (id reused, timeout
+# extends the client's wait budget)
+printf ';;; REQID: setup\n;;; TIMEOUT: 120\n(load "setup.lisp")\n' > setup-req.lisp
+./sbcl-client.sh file setup-req.lisp
 
 # Request headers (equivalent, written by hand instead of via the client)
 cat > next-sbcl-input.lisp << 'EOF'

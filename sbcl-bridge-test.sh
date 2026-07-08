@@ -60,6 +60,16 @@ echo "SBCL:       $("${SBCL_BIN:-sbcl}" --version 2>/dev/null || echo 'NOT FOUND
 echo "Bridge dir: $SBCL_BRIDGE_DIR"
 echo
 
+# Plant a canary userinit in a fake HOME: if the bridge (or the version
+# probe used by resume) ever loads init files again, the canary defines
+# a variable and prints to the log, and the checks below catch it.
+export HOME="$SBCL_BRIDGE_DIR/fakehome"
+mkdir -p "$HOME"
+cat > "$HOME/.sbclrc" <<'RCEOF'
+(format t "SMOKE-CANARY: USERINIT LOADED~%")
+(defparameter cl-user::*smoke-init-canary* t)
+RCEOF
+
 "$CTL" start >/dev/null || { echo "FATAL: bridge failed to start; check $SBCL_BRIDGE_DIR/sbcl-output.log"; exit 1; }
 sleep 0.7
 
@@ -101,6 +111,32 @@ if "$CLIENT" eval "$UNPRINTABLE" 2>/dev/null | grep -q '#<unprintable'; then
   ok "unprintable value degrades to placeholder, not status=error"
 else
   bad "unprintable value degrades to placeholder, not status=error"
+fi
+
+# --- Embedded request headers -----------------------------------------
+
+if "$CLIENT" eval $';;; REQID: smoke-fixed-id\n(+ 1 1)' 2>/dev/null \
+     | grep -q 'END-OUTPUT id=smoke-fixed-id status=ok'; then
+  ok "embedded REQID header is reused, not shadowed"
+else
+  bad "embedded REQID header is reused, not shadowed"
+fi
+
+expect_exit "embedded TIMEOUT header reaches the bridge -> exit 3" 3 \
+  "$CLIENT" eval $';;; TIMEOUT: 1\n(sleep 5)'
+
+expect_exit "SBCL_REQUEST_TIMEOUT env overrides embedded TIMEOUT" 0 \
+  env SBCL_REQUEST_TIMEOUT=none "$CLIENT" eval $';;; TIMEOUT: 1\n(progn (sleep 2) :ok)'
+
+# --- Clean environment (no init files) ---------------------------------
+
+if grep -q "SMOKE-CANARY" "$SBCL_BRIDGE_DIR/sbcl-output.log"; then
+  bad "bridge started without loading init files (canary .sbclrc was executed)"
+elif "$CLIENT" eval '(boundp (quote *smoke-init-canary*))' 2>/dev/null \
+       | grep -q '^;;; => NIL$'; then
+  ok "bridge started without loading init files"
+else
+  bad "bridge started without loading init files (canary variable is bound)"
 fi
 
 # --- Timeouts and cancellation ---------------------------------------

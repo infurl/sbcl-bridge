@@ -24,6 +24,13 @@
 # request is still queued and unclaimed, this script waits for the slot
 # instead of overwriting it, so sequential callers queue up safely.
 #
+# Header comments embedded in the submitted code itself are honored:
+# a leading ';;; REQID: <id>' is reused as the request id (instead of
+# being shadowed by a generated one), and a leading ';;; TIMEOUT: <s>'
+# both reaches the bridge and extends this script's own wait budget.
+# SBCL_REQUEST_TIMEOUT, when set, takes precedence over an embedded
+# TIMEOUT header.
+#
 # Exit codes: 0 ok, 1 evaluation error, 2 gave up within SBCL_TIMEOUT
 # (either the input slot never freed up, or no response arrived),
 # 3 evaluation timed out (bridge-side), 4 evaluation was cancelled,
@@ -35,26 +42,41 @@ SBCL_BRIDGE_DIR="${SBCL_BRIDGE_DIR:-.}"
 POLL_INTERVAL="${SBCL_POLL_INTERVAL:-0.2}"
 REQUEST_TIMEOUT="${SBCL_REQUEST_TIMEOUT:-}"
 
-# ${VAR:+x} (not ${VAR+x}): an SBCL_TIMEOUT explicitly set to the
-# empty string must fall through to the defaults below -- an empty
-# TIMEOUT compares as 0 in awk and would make this script "time out"
-# on its very first poll.
-if [ -n "${SBCL_TIMEOUT:+x}" ]; then
-  TIMEOUT="$SBCL_TIMEOUT"
-elif [[ "$REQUEST_TIMEOUT" =~ ^[0-9]+$ ]]; then
-  # Wait a little longer than the bridge-side evaluation timeout, so a
-  # bridge-side timeout gets reported properly (exit 3) instead of this
-  # script giving up first (exit 2) -- but never wait less than the
-  # normal 30s default.
-  TIMEOUT=$((REQUEST_TIMEOUT + 5))
-  [ "$TIMEOUT" -lt 30 ] && TIMEOUT=30
-else
-  # REQUEST_TIMEOUT unset, "none", or unparseable.
-  TIMEOUT=30
-fi
-
 INPUT_FILE="$SBCL_BRIDGE_DIR/next-sbcl-input.lisp"
 OUTPUT_LOG="$SBCL_BRIDGE_DIR/sbcl-output.log"
+
+extract_code_header() {
+  # extract_code_header KEY -- print the value of a leading
+  # ';;; KEY: value' header line in $CODE and return 0, or return 1 if
+  # no such header exists. Mirrors the bridge's own parser
+  # (match-header-line / extract-header in sbcl-bridge.lisp): only the
+  # leading run of well-formed header lines is scanned -- the first
+  # line that isn't ';;; ' followed by 'KEY: value' ends the scan --
+  # and the KEY comparison is case-insensitive.
+  local want line rest k v
+  want="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    case "$line" in
+      ';;; '*) rest="${line#';;; '}" ;;
+      *) return 1 ;;
+    esac
+    case "$rest" in
+      *:*) ;;
+      *) return 1 ;;
+    esac
+    k="$(printf '%s' "${rest%%:*}" \
+         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+         | tr '[:lower:]' '[:upper:]')"
+    v="$(printf '%s' "${rest#*:}" \
+         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if [ "$k" = "$want" ]; then
+      printf '%s\n' "$v"
+      return 0
+    fi
+  done <<<"$CODE"
+  return 1
+}
 
 usage() {
   cat >&2 <<EOF
@@ -68,9 +90,15 @@ Environment:
   SBCL_POLL_INTERVAL   polling interval in seconds (default: 0.2)
   SBCL_TIMEOUT         total seconds this script waits, covering both
                        queueing the request and receiving its response
-                       (default: 30, or SBCL_REQUEST_TIMEOUT+5 if larger)
+                       (default: 30, or the effective evaluation
+                       timeout + 5 if that's larger)
   SBCL_REQUEST_TIMEOUT seconds the bridge allows the evaluation to run
                        (default: bridge's own default; "none" to disable)
+
+Leading ';;; REQID: <id>' and ';;; TIMEOUT: <seconds|none>' header
+comments embedded in the submitted code are honored: the id is reused,
+and the timeout both reaches the bridge and extends this script's wait
+budget. SBCL_REQUEST_TIMEOUT overrides an embedded TIMEOUT header.
 EOF
   exit 1
 }
@@ -105,19 +133,62 @@ fi
 
 [ -f "$OUTPUT_LOG" ] || touch "$OUTPUT_LOG"
 
-# Unique request id. %N (nanoseconds) is a GNU date extension; on
-# BSD/macOS date it passes through as a literal 'N', which is harmless
-# here -- the PID and $RANDOM components keep ids unique on those
-# systems too (a collision would need the same second, a recycled PID,
-# and the same 15-bit random draw).
-REQID="$(date +%s%N)-$$-$RANDOM"
+# Headers embedded in the submitted code itself (any mode: file, eval,
+# or stdin) are honored, mirroring what the bridge does with them:
+#  - an embedded ';;; REQID:' is REUSED as this request's id instead of
+#    being shadowed by a generated one, so the response markers and the
+#    processed/ archive carry the id its author chose;
+#  - an embedded ';;; TIMEOUT:' informs this script's wait budget, so a
+#    file that grants itself 300 seconds isn't abandoned client-side at
+#    the default 30.
+# Precedence for the evaluation timeout: SBCL_REQUEST_TIMEOUT (env)
+# beats an embedded header -- the env header is prepended ahead of the
+# code and the bridge honors the first match -- which beats the bridge
+# default.
+FILE_REQID="$(extract_code_header REQID || true)"
+FILE_TIMEOUT="$(extract_code_header TIMEOUT || true)"
+
+EFFECTIVE_TIMEOUT="$REQUEST_TIMEOUT"
+[ -z "$EFFECTIVE_TIMEOUT" ] && EFFECTIVE_TIMEOUT="$FILE_TIMEOUT"
+
+# ${VAR:+x} (not ${VAR+x}): an SBCL_TIMEOUT explicitly set to the
+# empty string must fall through to the defaults below -- an empty
+# TIMEOUT compares as 0 in awk and would make this script "time out"
+# on its very first poll.
+if [ -n "${SBCL_TIMEOUT:+x}" ]; then
+  TIMEOUT="$SBCL_TIMEOUT"
+elif [[ "$EFFECTIVE_TIMEOUT" =~ ^[0-9]+$ ]]; then
+  # Wait a little longer than the bridge-side evaluation timeout, so a
+  # bridge-side timeout gets reported properly (exit 3) instead of this
+  # script giving up first (exit 2) -- but never wait less than the
+  # normal 30s default.
+  TIMEOUT=$((EFFECTIVE_TIMEOUT + 5))
+  [ "$TIMEOUT" -lt 30 ] && TIMEOUT=30
+else
+  # No timeout in effect anywhere, or "none", or unparseable.
+  TIMEOUT=30
+fi
+
+if [ -n "$FILE_REQID" ]; then
+  # Reusing a fixed id is fine for correlation (this script only scans
+  # log content appended after its own submission), but note the
+  # processed/ archive for a reused id overwrites the previous one.
+  REQID="$FILE_REQID"
+else
+  # Unique request id. %N (nanoseconds) is a GNU date extension; on
+  # BSD/macOS date it passes through as a literal 'N', which is
+  # harmless here -- the PID and $RANDOM components keep ids unique on
+  # those systems too (a collision would need the same second, a
+  # recycled PID, and the same 15-bit random draw).
+  REQID="$(date +%s%N)-$$-$RANDOM"
+fi
 
 # Write the request to a temp file in the SAME directory, then link it
 # into place atomically, so the bridge never sees a partial write.
 TMP_FILE="$(mktemp "$SBCL_BRIDGE_DIR/.next-sbcl-input.XXXXXX")"
 trap 'rm -f "$TMP_FILE"' EXIT
 {
-  printf ';;; REQID: %s\n' "$REQID"
+  [ -z "$FILE_REQID" ] && printf ';;; REQID: %s\n' "$REQID"
   [ -n "$REQUEST_TIMEOUT" ] && printf ';;; TIMEOUT: %s\n' "$REQUEST_TIMEOUT"
   printf '%s\n' "$CODE"
 } > "$TMP_FILE"

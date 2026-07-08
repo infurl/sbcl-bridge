@@ -156,7 +156,11 @@ prune_cores() {
 current_sbcl_info() {
   # Prints two lines: (lisp-implementation-version) and (machine-type),
   # using the same format that write-version-sidecar used at save time.
-  "$SBCL_BIN" --noinform --non-interactive \
+  # Init files are disabled here for the same determinism reason as in
+  # cmd_start -- and more urgently, because a ~/.sbclrc that prints
+  # anything would corrupt this exact two-line output and break the
+  # version comparison in check_core_compatibility.
+  "$SBCL_BIN" --noinform --non-interactive --no-sysinit --no-userinit \
     --eval '(progn (princ (lisp-implementation-version)) (terpri) (princ (machine-type)) (terpri))' \
     2>/dev/null
 }
@@ -304,7 +308,16 @@ cmd_start() {
   [ -f "$BRIDGE_LISP" ] || { echo "Cannot find $BRIDGE_LISP (set SBCL_BRIDGE_LISP)" >&2; exit 1; }
 
   echo "Starting fresh sbcl-bridge, watching $BRIDGE_DIR ..."
-  setsid "$SBCL_BIN" --non-interactive \
+  # --no-sysinit --no-userinit: never load /etc/sbclrc or ~/.sbclrc.
+  # The bridge must behave identically in a bare container and on a
+  # developer desktop; a stray userinit that loads Quicklisp, changes
+  # *print-* settings, or just prints something would make evaluation
+  # results (and the marker-parsing client) environment-dependent.
+  # Anything an init file would have provided can be loaded explicitly
+  # as an ordinary first request instead (e.g. a quicklisp-loader.lisp
+  # submitted via sbcl-client.sh), which also means it's captured in
+  # the input log and survives suspend/resume as image state.
+  setsid "$SBCL_BIN" --non-interactive --no-sysinit --no-userinit \
       --load "$BRIDGE_LISP" \
       --eval "(sbcl-bridge:run-bridge :directory $(lisp_string "$BRIDGE_DIR/"))" \
       < /dev/null >> "$OUTPUT_LOG" 2>&1 &
