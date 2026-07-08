@@ -70,10 +70,19 @@
 ;;;;   capturing all current definitions and global state, then exits.
 ;;;;   Running that saved image later (just executing the file) resumes
 ;;;;   the same polling loop, on the same directory, via a :toplevel
-;;;;   hook -- no --load/--eval flags needed on resume. A sidecar
-;;;;   "<core-path>.version" file records the SBCL version and machine
-;;;;   type in effect at save time, so a mismatched resume attempt can
-;;;;   be flagged.
+;;;;   hook -- no --load/--eval flags needed on resume (and, since the
+;;;;   image is saved with :save-runtime-options t, --eval flags are
+;;;;   flatly refused when run directly, so this isn't just a
+;;;;   convenience). A sidecar "<core-path>.version" file records the
+;;;;   SBCL version, machine type, and SBCL_HOME in effect at save
+;;;;   time, so a mismatched resume attempt can be flagged and contrib
+;;;;   modules can still be REQUIRE'd afterwards. The watched directory
+;;;;   itself, meanwhile, is deliberately NOT taken as gospel from the
+;;;;   saved image: an SBCL_BRIDGE_DIR in the resuming process's own
+;;;;   environment overrides it (see RESUME-BRIDGE), because a shared
+;;;;   workspace mounted at different paths in different environments
+;;;;   (a host and a container, say) is exactly the situation a saved
+;;;;   absolute path can't survive on its own.
 
 (defpackage :sbcl-bridge
   (:use :cl)
@@ -91,22 +100,36 @@ timeout unless a request overrides it with a TIMEOUT header.")
 (defparameter *bridge-directory* nil
   "Directory the running/most-recently-started bridge loop is watching.
 Preserved across save-lisp-and-die so a resumed image can re-enter
-run-bridge on the same directory without needing any arguments.")
+run-bridge on the same directory without needing any arguments -- but
+see RESUME-BRIDGE: an SBCL_BRIDGE_DIR in the resuming process's own
+environment takes precedence over this saved value, since a saved
+absolute path is exactly the kind of thing that goes stale when a core
+image is moved (e.g. a shared workspace mounted at different paths in
+a host environment and a container).")
 
 (defparameter *bridge-poll-interval* *default-poll-interval*
   "Poll interval in effect for the running bridge loop; preserved across
-suspend/resume the same way as *bridge-directory*.")
+suspend/resume the same way as *bridge-directory*. Unlike
+*bridge-directory*, this is NOT overridden from the environment on
+resume: it's a runtime tuning knob, not something tied to where the
+image happens to be running, so there's no equivalent of the
+moved-workspace problem to correct for here.")
 
 (defparameter *bridge-default-timeout* *default-request-timeout*
   "Default per-request timeout in effect for the running bridge loop;
-preserved across suspend/resume the same way as *bridge-directory*.")
+preserved across suspend/resume the same way as *bridge-directory*.
+Like *bridge-poll-interval*, this is session configuration, not a
+location, so it is intentionally NOT overridden from the environment
+on resume.")
 
 (defparameter *default-backtrace-frames* 20
   "Max number of stack frames to include in an error/backtrace report.")
 
 (defparameter *bridge-backtrace-frames* *default-backtrace-frames*
   "Backtrace frame limit in effect for the running bridge loop; preserved
-across suspend/resume the same way as *bridge-directory*.")
+across suspend/resume the same way as *bridge-directory*. Session
+configuration, not a location -- intentionally NOT overridden from the
+environment on resume, same reasoning as *bridge-poll-interval*.")
 
 (defparameter *cancel-file-name* "cancel-request"
   "Name of the control file an external tool can drop in the bridge
@@ -231,6 +254,37 @@ WITH-OUTPUT-LOCK (recursively).")
 
 ;;; ---------------------------------------------------------------------
 ;;; Helpers
+
+(defun ensure-directory-pathname (path)
+  "Coerce PATH (a string or pathname) into a proper directory
+pathname -- one with no NAME or TYPE component of its own -- so that
+\"/foo/bar\" and \"/foo/bar/\" both become #P\"/foo/bar/\" rather than
+#P\"/foo/bar\" being read as a file named \"bar\" inside directory
+\"/foo/\". This distinction is not pedantry: MERGE-PATHNAMES resolves a
+relative pathname against the DIRECTORY of its default, ignoring the
+default's NAME entirely, so a caller-supplied directory that still
+carries a spurious NAME component silently loses its last path segment
+the moment anything is merged against it -- e.g. merging
+\"next-sbcl-input.lisp\" against the wrongly-parsed #P\"/workspace\"
+(name \"workspace\", directory just (:ABSOLUTE)) produces
+#P\"/next-sbcl-input.lisp\", not #P\"/workspace/next-sbcl-input.lisp\".
+A previous version of this function attempted the same fix via
+ (merge-pathnames (make-pathname :directory '(:relative)) p)
+which looks plausible but does NOT work: MERGE-PATHNAMES's component-
+substitution rule pulls the default pathname's NAME back in whenever
+the pathname argument leaves NAME unspecified, even though the
+DIRECTORY component came out correctly merged -- so the broken name
+survived the \"fix\" untouched. The only reliable approach is to
+reconstruct the name+type as an explicit final directory component by
+hand, which is what this function does."
+  (let ((p (pathname path)))
+    (if (or (pathname-name p) (pathname-type p))
+        (make-pathname
+         :directory (append (or (pathname-directory p) '(:relative))
+                             (list (file-namestring p)))
+         :name nil :type nil
+         :defaults p)
+        p)))
 
 (defun slurp-file (path)
   "Read the entire contents of PATH as a string."
@@ -541,11 +595,7 @@ Does not return under normal operation."
   (setf *bridge-default-timeout* default-timeout)
   (setf *bridge-backtrace-frames* backtrace-frames)
   (install-debugger-hook)
-  (let* ((dir (let ((p (pathname directory)))
-                ;; make sure it's treated as a directory pathname
-                (if (pathname-name p)
-                    (merge-pathnames (make-pathname :directory '(:relative)) p)
-                    p)))
+  (let* ((dir (ensure-directory-pathname directory))
          (input-path (merge-pathnames input-name dir))
          (working-path (merge-pathnames working-name dir))
          (input-log-path (merge-pathnames input-log-name dir))
@@ -634,7 +684,40 @@ Does not return under normal operation."
 (defun resume-bridge ()
   "Entry point baked into a suspended image via save-lisp-and-die's
 :toplevel; re-enters the polling loop with the settings that were in
-effect when the image was saved."
+effect when the image was saved -- except for the watched directory,
+which is instead taken from the resuming process's own SBCL_BRIDGE_DIR
+environment variable when one is set.
+
+This matters for exactly the scenario *bridge-directory*'s docstring
+describes: a core suspended with one absolute path baked in (say
+/home/andrew/workspace/sbcl-bridge, because that's where it happens to
+live on the host) and then resumed somewhere the same shared workspace
+is mounted at a different path (say /workspace/sbcl-bridge, inside a
+container). Without this override the resumed bridge would be
+healthy, watching, and running -- and silently looking in the wrong
+directory, seeing no requests ever arrive. An --eval-based override on
+the command line is not an option here: suspend-bridge saves with
+:save-runtime-options t, which makes the resulting executable refuse
+to parse ANY runtime options (including --eval) when run directly,
+which is the primary way sbcl-bridge-ctl.sh's resume command invokes
+it. Reading the environment from ordinary Lisp code after the runtime
+has already started is the one mechanism that works uniformly
+regardless of invocation style (direct executable, or `sbcl --core`).
+
+Only the directory is treated this way. *bridge-poll-interval*,
+*bridge-default-timeout*, and *bridge-backtrace-frames* are ordinary
+session configuration rather than anything location-dependent, so they
+continue to carry over from the saved image unconditionally -- see
+their docstrings."
+  (let ((dir-override (sb-ext:posix-getenv "SBCL_BRIDGE_DIR")))
+    (when (and dir-override (plusp (length dir-override))
+               (not (equal dir-override (ignore-errors (namestring *bridge-directory*)))))
+      (with-output-lock
+        (format t "~&;;; RESUME: SBCL_BRIDGE_DIR=~a overrides the directory saved in this ~
+image (~a)~%"
+                dir-override *bridge-directory*)
+        (finish-output))
+      (setf *bridge-directory* dir-override)))
   (run-bridge :directory *bridge-directory*
               :poll-interval *bridge-poll-interval*
               :default-timeout *bridge-default-timeout*

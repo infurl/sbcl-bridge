@@ -271,6 +271,49 @@ else
   bad "state survives suspend/resume"
 fi
 
+# --- Moved workspace: SBCL_BRIDGE_DIR override on resume ---------------
+#
+# The scenario this feature exists for: a core suspended while watching
+# one directory must be resumable from a DIFFERENT directory (a shared
+# workspace mounted at different paths on a host and inside a
+# container, say), with requests submitted at the NEW location actually
+# answered rather than the resumed bridge silently watching the stale
+# baked-in path. This also pins down a pathname-normalization edge
+# case: environment variables conventionally carry no trailing slash
+# (unlike ctl.sh's own internal directory-argument convention), which a
+# naive directory-pathname coercion can silently mishandle by dropping
+# the last path segment entirely -- turning "/some/dir" into "/",
+# watching (and writing logs into) the wrong place with no error.
+"$CLIENT" eval '(defparameter *moved-marker* :still-here)' >/dev/null 2>&1
+"$CTL" suspend >/dev/null 2>&1
+MOVED_CORE="$(ls -t "$SBCL_BRIDGE_DIR"/cores/*.core 2>/dev/null | head -1)"
+MOVED_DIR="$(mktemp -d)"
+if [ -n "$MOVED_CORE" ]; then
+  mkdir -p "$MOVED_DIR/cores"
+  cp "$MOVED_CORE" "$MOVED_DIR/cores/"
+  [ -f "$MOVED_CORE.version" ] && cp "$MOVED_CORE.version" "$MOVED_DIR/cores/"
+  chmod +x "$MOVED_DIR"/cores/*.core
+
+  ORIG_BRIDGE_DIR="$SBCL_BRIDGE_DIR"
+  export SBCL_BRIDGE_DIR="$MOVED_DIR"
+  "$CTL" resume >/dev/null 2>&1
+  sleep 0.7
+  if "$CLIENT" eval '*moved-marker*' 2>/dev/null | grep -q ':STILL-HERE'; then
+    ok "resume honors SBCL_BRIDGE_DIR pointing at a moved workspace"
+  else
+    bad "resume honors SBCL_BRIDGE_DIR pointing at a moved workspace"
+  fi
+  "$CTL" stop >/dev/null 2>&1
+
+  # Restore the original bridge dir and state for the remaining tests.
+  export SBCL_BRIDGE_DIR="$ORIG_BRIDGE_DIR"
+  "$CTL" resume >/dev/null 2>&1
+  sleep 0.7
+else
+  bad "resume honors SBCL_BRIDGE_DIR pointing at a moved workspace (no core found)"
+fi
+rm -rf "$MOVED_DIR"
+
 # Contrib REQUIRE after a resume: exercises the SBCL_HOME sidecar
 # restore. sb-posix must NOT have been loaded before the suspend for
 # this to be meaningful (the bridge itself only uses built-in modules).

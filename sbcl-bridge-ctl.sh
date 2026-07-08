@@ -58,6 +58,16 @@ POLL_INTERVAL=0.3
 mkdir -p "$BRIDGE_DIR" "$CORE_DIR"
 touch "$OUTPUT_LOG"
 
+# Absolute, symlink-resolved form of BRIDGE_DIR, computed once. Used
+# only to export SBCL_BRIDGE_DIR into a launched bridge process's own
+# environment (see cmd_start / cmd_resume) -- deliberately NOT used to
+# overwrite BRIDGE_DIR itself, which the rest of this script is free to
+# keep using in whatever (possibly relative) form the caller gave it.
+# Computed via 'cd && pwd' rather than readlink -f so it has no
+# dependency beyond mkdir -p having already guaranteed the directory
+# exists a moment ago.
+BRIDGE_DIR_ABS="$(cd "$BRIDGE_DIR" && pwd)"
+
 # ---------------------------------------------------------------------
 # Helpers
 
@@ -401,7 +411,16 @@ cmd_start() {
   rm -f "$PID_FILE"
   [ -f "$BRIDGE_LISP" ] || { echo "Cannot find $BRIDGE_LISP (set SBCL_BRIDGE_LISP)" >&2; exit 1; }
 
-  echo "Starting fresh sbcl-bridge, watching $BRIDGE_DIR ..."
+  echo "Starting fresh sbcl-bridge, watching $BRIDGE_DIR_ABS ..."
+  # Export SBCL_BRIDGE_DIR (absolute form) into the bridge's own
+  # environment too, even though run-bridge is given :directory
+  # explicitly below and doesn't need it: this makes "a running
+  # bridge's environment has an accurate SBCL_BRIDGE_DIR" a reliable
+  # invariant regardless of whether it was freshly started or resumed
+  # (see cmd_resume), which matters if user-submitted code -- e.g. a
+  # setup script wanting to resolve workspace-relative paths itself --
+  # reads it directly via (sb-ext:posix-getenv "SBCL_BRIDGE_DIR").
+  export SBCL_BRIDGE_DIR="$BRIDGE_DIR_ABS"
   # --no-sysinit --no-userinit: never load /etc/sbclrc or ~/.sbclrc.
   # The bridge must behave identically in a bare container and on a
   # developer desktop; a stray userinit that loads Quicklisp, changes
@@ -413,7 +432,7 @@ cmd_start() {
   # the input log and survives suspend/resume as image state.
   setsid "$SBCL_BIN" --non-interactive --no-sysinit --no-userinit \
       --load "$BRIDGE_LISP" \
-      --eval "(sbcl-bridge:run-bridge :directory $(lisp_string "$BRIDGE_DIR/"))" \
+      --eval "(sbcl-bridge:run-bridge :directory $(lisp_string "$BRIDGE_DIR_ABS/"))" \
       < /dev/null >> "$OUTPUT_LOG" 2>&1 &
   local pid=$!
   disown "$pid" 2>/dev/null || true
@@ -576,6 +595,20 @@ cmd_resume() {
   check_core_compatibility "$core_path"
 
   echo "Resuming from $core_path ..."
+  # Export SBCL_BRIDGE_DIR explicitly for the child, as an ABSOLUTE
+  # path, rather than relying on it already being set (and exported)
+  # in this shell's environment: the resumed image reads it (see
+  # resume-bridge in sbcl-bridge.lisp) to correct a directory baked in
+  # at suspend time that may no longer be valid here -- e.g. a shared
+  # workspace mounted at a different path in a container than on the
+  # host it was suspended from. Using BRIDGE_DIR_ABS (rather than
+  # BRIDGE_DIR, which may be the relative default ".") means the
+  # override is correct regardless of the resumed process's own
+  # working directory, and unconditional (rather than only exporting
+  # when SBCL_BRIDGE_DIR was explicitly set by the caller) means a
+  # user who never touches SBCL_BRIDGE_DIR at all still gets a
+  # consistent, correct, absolute value on the Lisp side.
+  export SBCL_BRIDGE_DIR="$BRIDGE_DIR_ABS"
   if [ -x "$core_path" ]; then
     setsid "$core_path" < /dev/null >> "$OUTPUT_LOG" 2>&1 &
   else
