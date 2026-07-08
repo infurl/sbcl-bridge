@@ -656,7 +656,18 @@ into SBCL_HOME by sbcl-bridge-ctl.sh's resume command."
     (format s "~a~%~a~%~a~%"
             (lisp-implementation-version)
             (machine-type)
-            (let ((home (sb-int:sbcl-homedir-pathname)))
+            ;; Best-effort home: what this image derives itself, or --
+            ;; important for a suspend of a RESUMED image, where the
+            ;; derivation can come back NIL -- the SBCL_HOME that
+            ;; sbcl-bridge-ctl.sh exported when resuming us. Normalized
+            ;; via TRUENAME where possible so the sidecar carries
+            ;; /usr/lib/sbcl/ rather than /usr/bin/../lib/sbcl/.
+            (let* ((home (or (sb-int:sbcl-homedir-pathname)
+                             (let ((env (sb-ext:posix-getenv "SBCL_HOME")))
+                               (and env (plusp (length env))
+                                    (ignore-errors (pathname env))))))
+                   (home (and home
+                              (or (ignore-errors (truename home)) home))))
               (if home (namestring home) "")))))
 
 (defun archive-own-request ()
@@ -698,12 +709,18 @@ cl:require for a contrib module NOT already loaded before this
 suspend will fail with \"Don't know how to REQUIRE ...\" after a
 resume, even though the exact same code works fine on a fresh start.
 write-version-sidecar records the home directory this process actually
-had at save time so sbcl-bridge-ctl.sh's resume command can restore it
-via the SBCL_HOME environment variable. The more robust fix, when it's
-an option, is to load (via quickload or plain require) everything your
-workload needs BEFORE suspending -- once a contrib is loaded into the
-image, it's baked into the heap and never needs to be found on disk
-again after a resume."
+had at save time (normalized via TRUENAME, and falling back to the
+SBCL_HOME we were ourselves resumed with, so the record survives
+suspend/resume chains) so sbcl-bridge-ctl.sh's resume command can
+restore a home via the SBCL_HOME environment variable. Resume treats
+the recorded value as a VALIDATED CANDIDATE rather than gospel -- the
+resuming machine may be a different host or container whose sbcl lives
+at another prefix, in which case resume prefers the local
+installation's own home when its build matches this image. The more
+robust fix, when it's an option, is to load (via quickload or plain
+require) everything your workload needs BEFORE suspending -- once a
+contrib is loaded into the image, it's baked into the heap and never
+needs to be found on disk again after a resume."
   (with-output-lock
     (format t "~&;;; SUSPENDING to ~a~%" core-path)
     (finish-output))

@@ -70,6 +70,10 @@ cat > "$HOME/.sbclrc" <<'RCEOF'
 (defparameter cl-user::*smoke-init-canary* t)
 RCEOF
 
+# An inherited SBCL_HOME would mask the resume-time restoration logic
+# these tests exercise (a caller-provided value always wins there).
+unset SBCL_HOME
+
 "$CTL" start >/dev/null || { echo "FATAL: bridge failed to start; check $SBCL_BRIDGE_DIR/sbcl-output.log"; exit 1; }
 sleep 0.7
 
@@ -225,6 +229,27 @@ if "$CLIENT" eval '(require :sb-posix) (sb-posix:getpid)' >/dev/null 2>&1; then
   ok "contrib REQUIRE works after resume (SBCL_HOME restored)"
 else
   bad "contrib REQUIRE works after resume (SBCL_HOME restored)"
+fi
+
+# Cross-environment resume: the sidecar's recorded SBCL_HOME points at
+# a prefix that doesn't exist HERE (the shared-workspace scenario:
+# suspend on the host, resume the same core inside a container whose
+# sbcl lives elsewhere). Resume must detect the dead path and restore
+# a validated home from the local installation instead, so contrib
+# REQUIRE still works.
+"$CTL" suspend >/dev/null 2>&1
+XENV_SIDECAR="$(ls -t "$SBCL_BRIDGE_DIR"/cores/*.version 2>/dev/null | head -1)"
+if [ -n "$XENV_SIDECAR" ]; then
+  sed -i '3s|.*|/nonexistent-host-prefix/lib/sbcl/|' "$XENV_SIDECAR"
+  "$CTL" resume >/dev/null 2>&1
+  sleep 0.7
+  if "$CLIENT" eval '(require :sb-cover) :cross-env-ok' 2>/dev/null | grep -q ':CROSS-ENV-OK'; then
+    ok "cross-environment resume restores a usable SBCL_HOME"
+  else
+    bad "cross-environment resume restores a usable SBCL_HOME"
+  fi
+else
+  bad "cross-environment resume restores a usable SBCL_HOME (no sidecar found)"
 fi
 
 # Suspend queued behind a long request must be withdrawn on timeout.

@@ -165,42 +165,136 @@ current_sbcl_info() {
     2>/dev/null
 }
 
-check_core_compatibility() {
-  local core_path="$1"
-  local version_file="${core_path}.version"
-  if [ ! -f "$version_file" ]; then
-    echo "WARNING: no version metadata found for $core_path; cannot verify compatibility with $SBCL_BIN," >&2
-    echo "         and cannot restore SBCL_HOME -- contrib modules (sb-posix, sb-rotate-byte, etc.)" >&2
-    echo "         not already loaded before the suspend may fail to REQUIRE after resuming." >&2
-    return 0
-  fi
-  local saved_version saved_machine saved_home current_version current_machine
-  saved_version="$(sed -n '1p' "$version_file")"
-  saved_machine="$(sed -n '2p' "$version_file")"
-  saved_home="$(sed -n '3p' "$version_file")"
-  { read -r current_version; read -r current_machine; } < <(current_sbcl_info)
-  if [ "$saved_version" != "$current_version" ] || [ "$saved_machine" != "$current_machine" ]; then
-    echo "WARNING: $core_path was saved with SBCL $saved_version ($saved_machine)," >&2
-    echo "         but $SBCL_BIN here reports $current_version ($current_machine)." >&2
-    echo "         Resuming anyway, since it's a self-contained executable image," >&2
-    echo "         but this may fail or misbehave if the mismatch is significant." >&2
-  fi
+current_sbcl_home() {
+  # Ask the CURRENT $SBCL_BIN where its own home directory is (init
+  # files disabled so nothing can pollute the single-line output).
+  # Prints nothing if sbcl is missing or reports no home.
+  "$SBCL_BIN" --noinform --non-interactive --no-sysinit --no-userinit \
+    --eval '(let ((h (sb-int:sbcl-homedir-pathname))) (when h (princ (namestring h))))' \
+    2>/dev/null
+}
 
+valid_sbcl_home() {
+  # An SBCL_HOME candidate is usable iff it is a directory containing a
+  # contrib/ subdirectory -- that is what REQUIRE of sb-posix, uiop,
+  # asdf, etc. actually needs from it.
+  [ -n "$1" ] && [ -d "$1" ] && [ -d "${1%/}/contrib" ]
+}
+
+normalize_home() {
+  # Resolve '..' segments and symlinks for readability (the raw value
+  # is typically '<prefix>/bin/../lib/sbcl/'); fall back to the input
+  # untouched where readlink -f is unavailable.
+  readlink -f "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+restore_sbcl_home() {
+  # restore_sbcl_home SAVED_VERSION SAVED_MACHINE SAVED_HOME
+  #
   # A resumed executable image has no idea where SBCL's contrib modules
-  # (sb-posix, sb-rotate-byte, sb-bsd-sockets, ...) live on disk --
+  # (sb-posix, uiop, asdf, sb-bsd-sockets, ...) live on disk --
   # (sb-int:sbcl-homedir-pathname) comes back NIL after a resume, since
   # that's normally derived from the location of the running sbcl
   # binary, and the saved image is just a data blob that can be sitting
   # anywhere (typically this bridge's own cores/ directory). Anything
   # that REQUIREs a contrib not already loaded before the suspend would
   # otherwise fail with "Don't know how to REQUIRE ..." even though the
-  # exact same code works fine on a fresh start. Restore it from what
-  # was recorded at suspend time, unless the caller already set their
-  # own SBCL_HOME explicitly.
-  if [ -n "$saved_home" ] && [ -z "${SBCL_HOME:-}" ]; then
-    export SBCL_HOME="$saved_home"
-    echo "Restoring SBCL_HOME=$SBCL_HOME (recorded at suspend time) so contrib modules still REQUIRE correctly."
+  # exact same code works fine on a fresh start.
+  #
+  # The sidecar's recorded home is only trustworthy if the resuming
+  # environment is the suspending one. In the shared-workspace workflow
+  # (suspend on the host, resume the same core inside a container, or
+  # vice versa) the recorded '<prefix>/bin/../lib/sbcl/' may not exist
+  # here at all -- e.g. a locally built sbcl under /usr/local on one
+  # side and the distro package under /usr on the other -- or may exist
+  # but hold contrib fasls built by a different SBCL version, which the
+  # resumed image cannot load. So every candidate is VALIDATED (exists,
+  # has contrib/), and preference depends on whether this environment's
+  # sbcl matches the image:
+  #
+  #   same version+machine  -> prefer the LOCAL installation's home
+  #                            (its fasls are guaranteed to match the
+  #                            image, wherever it lives), sidecar as
+  #                            fallback;
+  #   different/unknown     -> prefer the SIDECAR home (the only place
+  #                            with matching-version fasls, if it still
+  #                            exists here), local home as a last
+  #                            resort with a warning.
+  #
+  # A caller-provided SBCL_HOME always wins, but gets sanity-checked.
+  local saved_version="$1" saved_machine="$2" saved_home="$3"
+  local current_version="$4" current_machine="$5"
+
+  if [ -n "${SBCL_HOME:-}" ]; then
+    if ! valid_sbcl_home "$SBCL_HOME"; then
+      echo "WARNING: respecting caller-provided SBCL_HOME=$SBCL_HOME, but it doesn't look like" >&2
+      echo "         an SBCL home (missing directory or contrib/ inside it); REQUIRE of" >&2
+      echo "         contrib modules will likely fail." >&2
+    fi
+    return 0
   fi
+
+  local here_home chosen="" origin=""
+  here_home="$(current_sbcl_home)"
+
+  if [ -n "$saved_version" ] \
+     && [ "$saved_version" = "$current_version" ] \
+     && [ "$saved_machine" = "$current_machine" ]; then
+    if valid_sbcl_home "$here_home"; then
+      chosen="$here_home"; origin="this machine's $SBCL_BIN installation"
+    elif valid_sbcl_home "$saved_home"; then
+      chosen="$saved_home"; origin="the suspend-time sidecar"
+    fi
+  else
+    if valid_sbcl_home "$saved_home"; then
+      chosen="$saved_home"; origin="the suspend-time sidecar"
+    elif valid_sbcl_home "$here_home"; then
+      chosen="$here_home"
+      origin="this machine's $SBCL_BIN installation"
+      echo "WARNING: falling back to the local SBCL_HOME even though the local SBCL build" >&2
+      echo "         (${current_version:-unknown}) differs from the image's (${saved_version:-unknown});" >&2
+      echo "         its contrib fasls may be rejected by the resumed image." >&2
+    fi
+  fi
+
+  if [ -n "$chosen" ]; then
+    local resolved
+    resolved="$(normalize_home "$chosen")"
+    export SBCL_HOME="$resolved"
+    echo "Restoring SBCL_HOME=$SBCL_HOME (from $origin) so contrib modules still REQUIRE correctly."
+  else
+    echo "WARNING: no usable SBCL_HOME found -- the sidecar recorded '${saved_home:-nothing}'," >&2
+    echo "         and the local $SBCL_BIN reports '${here_home:-nothing}'; neither is a" >&2
+    echo "         directory with a contrib/ inside it. Contrib modules (sb-posix, uiop," >&2
+    echo "         asdf, ...) not already loaded before the suspend will fail to REQUIRE." >&2
+  fi
+}
+
+check_core_compatibility() {
+  local core_path="$1"
+  local version_file="${core_path}.version"
+  local saved_version="" saved_machine="" saved_home=""
+  local current_version="" current_machine=""
+  { read -r current_version; read -r current_machine; } < <(current_sbcl_info)
+
+  if [ -f "$version_file" ]; then
+    saved_version="$(sed -n '1p' "$version_file")"
+    saved_machine="$(sed -n '2p' "$version_file")"
+    saved_home="$(sed -n '3p' "$version_file")"
+    if [ "$saved_version" != "$current_version" ] || [ "$saved_machine" != "$current_machine" ]; then
+      echo "WARNING: $core_path was saved with SBCL $saved_version ($saved_machine)," >&2
+      echo "         but $SBCL_BIN here reports $current_version ($current_machine)." >&2
+      echo "         Resuming anyway, since it's a self-contained executable image," >&2
+      echo "         but this may fail or misbehave if the mismatch is significant." >&2
+    fi
+  else
+    echo "WARNING: no version metadata found for $core_path; cannot verify compatibility" >&2
+    echo "         with $SBCL_BIN. Attempting to restore SBCL_HOME from the local" >&2
+    echo "         installation instead." >&2
+  fi
+
+  restore_sbcl_home "$saved_version" "$saved_machine" "$saved_home" \
+                    "$current_version" "$current_machine"
 }
 
 # --- Log rotation -------------------------------------------------

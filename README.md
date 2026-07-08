@@ -549,7 +549,6 @@ knows its own identity and how long it's allowed to take:
 ;;; TIMEOUT: 45
 
 (in-package #:cl-user)
-#-quicklisp
 (load #P"/usr/share/common-lisp/source/quicklisp/quicklisp.lisp")
 (ql:quickload "alexandria")
 ;; ...
@@ -829,20 +828,41 @@ file.
   sbcl binary itself*, and a saved image is just a data blob that can be
   executed from anywhere (typically this bridge's own `cores/` directory,
   nowhere near the real SBCL install). Anything that calls `cl:require` for a
-  contrib (`sb-posix`, `sb-rotate-byte`, `sb-bsd-sockets`, etc. — and note
+  contrib (`sb-posix`, `uiop`, `asdf`, `sb-bsd-sockets`, etc. — and note
   that many Quicklisp systems pull these in transitively, e.g. `cl-postgres`
   needs `sb-rotate-byte`) that wasn't already loaded *before* the suspend will
   fail with `Don't know how to REQUIRE ...` after a resume, even though the
-  exact same code works perfectly on a fresh `start`. `write-version-sidecar`
-  records the home directory the process actually had at save time, and
-  `ctl.sh resume` automatically restores it via the `SBCL_HOME` environment
-  variable before launching — unless you've already set `SBCL_HOME` yourself,
-  which is always respected. The more robust practice, when it's an option:
-  load (via `ql:quickload` or plain `require`) everything your workload needs
-  *before* suspending. Once a contrib is loaded into the image, its code is
-  baked into the heap and never needs to be found on disk again after a resume
-  — this is why suspending only after your environment is fully set up (rather
-  than right after a bare `start`) is the better habit to build.
+  exact same code works perfectly on a fresh `start`.
+
+  `write-version-sidecar` records the home directory in effect at save time
+  (normalized via `truename`, and falling back to the `SBCL_HOME` this
+  process was itself resumed with, so the record survives chains of
+  suspend/resume cycles), and `ctl.sh resume` restores a home into the
+  `SBCL_HOME` environment variable before launching. Crucially, the recorded
+  value is **not trusted blindly**: the machine that suspended the core may
+  not be the machine resuming it. The canonical case is a shared-workspace
+  workflow — suspend on the host, resume the identical core inside a
+  container (or vice versa) — where the two sides' `sbcl` binaries live at
+  different prefixes (`/usr/local` build on one side, the distro package
+  under `/usr` on the other), so the recorded `<prefix>/lib/sbcl/` simply
+  doesn't exist on the resuming side; or it exists but holds contrib fasls
+  built by a different SBCL version, which the resumed image can't load.
+  `resume` therefore *validates* every candidate (the directory must exist
+  and contain `contrib/`) and picks by provenance: if the local `sbcl`'s
+  build matches the image's, the **local installation's** home is preferred
+  (its fasls are guaranteed compatible, wherever it lives), with the sidecar
+  as fallback; if the builds differ, the **sidecar's** home is preferred
+  (the only place with matching-version fasls, if it still exists), with the
+  local home as a warned-about last resort. A caller-provided `SBCL_HOME`
+  always wins but is sanity-checked, and if nothing validates, `resume`
+  says so loudly instead of exporting a dead path.
+
+  The more robust practice, when it's an option: load (via `ql:quickload` or
+  plain `require`) everything your workload needs *before* suspending. Once
+  a contrib is loaded into the image, its code is baked into the heap and
+  never needs to be found on disk again after a resume — this is why
+  suspending only after your environment is fully set up (rather than right
+  after a bare `start`) is the better habit to build.
 
 - **Core retention.** `ctl.sh suspend` prunes down to `SBCL_CORE_RETAIN`
   (default 3) most recent images — but only *after* confirming the new one
@@ -1010,11 +1030,13 @@ Worth internalizing before you rely on this in production:
   possible edge case is fine either.
 
 - **Contrib modules loaded for the first time only after a resume** can still
-  fail if you're resuming a core that predates the `SBCL_HOME`-recording fix,
-  or if you're loading the saved core directly (via `sbcl --core ...`) rather
-  than through `ctl.sh resume` — the auto-restore lives in the shell script,
-  not the core image itself. When in doubt, load everything your workload
-  needs in a fresh image before suspending (see §8.4).
+  fail if you're loading the saved core directly (via `sbcl --core ...` or by
+  executing the image) rather than through `ctl.sh resume` — the validated
+  `SBCL_HOME` restoration lives in the shell script, not the core image
+  itself — or if *neither* the sidecar's recorded home *nor* the local sbcl
+  installation's home is usable on the resuming machine (resume warns loudly
+  in that case). When in doubt, load everything your workload needs in a
+  fresh image before suspending (see §8.4).
 
 - **No log rotation or archive pruning without something calling `status`.**
   If nothing ever polls `status` and you never explicitly call `rotate-logs`,
@@ -1068,11 +1090,20 @@ Worth internalizing before you rely on this in production:
 
 - **`;;; ERROR: Don't know how to REQUIRE <some-contrib>` after a resume, but
   the identical code works on a fresh `start`**
-  - Expected, and automatically fixed since the `SBCL_HOME` sidecar fix — see
-	§8.4. If you're still seeing it: confirm you resumed via `ctl.sh resume`
-	(not by running the `.core` file directly, and not via `sbcl --core ...`
-	by hand), and that the core was suspended *after* that fix was applied.
-	Otherwise, load the failing library before suspending next time.
+  - Handled automatically by resume's validated `SBCL_HOME` restoration — see
+	§8.4 — including the shared-workspace case where the core was suspended
+	on a *different machine* (host vs. container) whose sbcl lives at a
+	different prefix: `resume` detects that the sidecar's recorded path is
+	unusable here and restores the local installation's home instead. If
+	you're still seeing it: (1) confirm you resumed via `ctl.sh resume`, not
+	by running the `.core` file directly or via `sbcl --core ...` by hand —
+	the restoration lives in the shell script; (2) look for the resume-time
+	`WARNING: no usable SBCL_HOME found` message, which means neither the
+	sidecar's path nor the local sbcl's home exists here with a `contrib/`
+	inside it; (3) check whether an inherited `SBCL_HOME` in your environment
+	is pointing somewhere stale — a caller-provided value is respected even
+	when it's wrong (with a warning). Otherwise, load the failing library
+	before suspending next time.
 
 - **A stray `sbcl` process left over from a previous test**
   - `ps aux | grep sbcl-bridge.lisp`, then `kill` it — `ctl.sh stop` only
