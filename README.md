@@ -287,7 +287,7 @@ itself:
 ```bash
 ./sbcl-bridge-test.sh
 # ...
-# == 21 passed, 0 failed ==
+# == 31 passed, 0 failed ==
 ```
 
 ---
@@ -397,6 +397,18 @@ shell scripts are for), but it's useful to know what's in it.
 
 No systemd required. Uses a PID file and plain `kill`, works identically
 inside a container.
+
+**Exit codes:** `0` on success, `1` on any failure, uniformly across every
+subcommand — the conventional shell-tool convention (like `git`, `docker`,
+`systemctl`), not the finely-subdivided scheme `sbcl-client.sh` uses (§7).
+This is a deliberate difference, not an oversight: `ctl.sh` is a lifecycle
+tool whose callers are humans and `Makefile`/`docker` orchestration that
+branch on "did this succeed", with the specific reason always in the stderr
+message. `sbcl-client.sh`, by contrast, runs in the hot path of an
+agent's request/response loop, where the caller genuinely needs to
+distinguish outcomes programmatically (`retry` vs. `give up` vs. `treat as
+an evaluation error`) without parsing text — which is what earns its exit
+codes a fully enumerated, disjoint contract.
 
 ### Commands
 
@@ -508,6 +520,31 @@ sbcl-client.sh -                            # read code from stdin
 
 The client:
 
+0. Before touching anything, checks that `SBCL_BRIDGE_DIR` actually looks
+   like it's being watched by a *live* bridge, rather than just assuming a
+   directory that happens to exist is one. A directory can exist and still
+   have no bridge behind it — nobody ever started one there, or one used to
+   run but crashed or was `stop`ped — and without this check a submission
+   against a dead bridge would otherwise sit until `SBCL_TIMEOUT` and then
+   report a misleading "timed out waiting for response" (exit 2) instead of
+   the real problem. Concretely, the check:
+   - fails if `SBCL_BRIDGE_DIR` doesn't exist at all;
+   - fails if there's no `.sbcl-bridge.pid` in it;
+   - fails if the recorded pid isn't `kill -0`-alive (a stale pidfile from a
+	 crashed or manually-`kill`ed process);
+   - fails if, per `/proc/<pid>/cmdline` where readable, the alive process
+	 doesn't look like `sbcl` at all — guarding against the same PID-reuse
+	 edge case `ctl.sh status` guards against (§9): a crash followed by the
+	 OS recycling that pid for an unrelated process.
+
+   Each failure prints a specific reason and exits 6, pointing at `ctl.sh
+   start` where that's the likely fix. This is a **liveness check, not a
+   guarantee** — the bridge can still crash, hang, or belong to a
+   completely different `SBCL_BRIDGE_LISP` between this check and the actual
+   submission a moment later — but it turns the most common misconfiguration
+   (pointing the client at the wrong, or no longer running, bridge) into an
+   immediate, specific error instead of a slow, generic timeout.
+
 1. Scans the leading `;;; KEY: value` header comments of the submitted code
    (any mode — `file`, `eval`, or stdin) with the same parser rules the
    bridge uses, and honors what it finds: an embedded `;;; REQID:` is
@@ -598,17 +635,30 @@ for requests you want to tell apart later.
 
 ### Exit codes
 
+This is a deliberate, disjoint scheme meant to be a stable contract for
+scripted or agent callers: each code means exactly one thing, never two.
+Codes **0–5** mean the request was delivered and the bridge reported an
+outcome for it. Codes **6–7** mean the request was **never delivered** —
+nothing was evaluated, and there is no `BEGIN-OUTPUT`/`END-OUTPUT` pair in
+the log for the attempt.
+
+Bridge reported an outcome (0–5):
+
 - **0** — `status=ok`
 
 - **1** — `status=error`
-  - An `ERROR` condition was signalled.
+  - An `ERROR` condition was signalled while evaluating the submitted code.
 
-- **2** — client-side wait timeout
-  - The client gave up within `SBCL_TIMEOUT` — either the input slot never
-	freed up (another request stayed queued), or no response arrived.
+- **2** — no response in time
+  - The request **was** successfully submitted, but no response arrived
+	within the wait budget (`SBCL_TIMEOUT`, or the computed default). The
+	bridge may still be working on it — this is this *script* giving up
+	waiting, not the bridge reporting a timeout (see the note on exit 3
+	below).
 
 - **3** — `status=timeout`
-  - The bridge-side per-request timeout expired.
+  - The bridge-side per-request timeout expired (`SBCL_REQUEST_TIMEOUT` or
+	an embedded `TIMEOUT` header).
 
 - **4** — `status=cancelled`
   - Cancelled via `ctl.sh interrupt`.
@@ -616,12 +666,35 @@ for requests you want to tell apart later.
 - **5** — `status=fatal-condition`
   - A non-`ERROR` `SERIOUS-CONDITION` occurred.
 
-Note the distinction between exit code 2 (this *script* gave up waiting) and
-exit code 3 (the *bridge* gave up evaluating). If you set
-`SBCL_REQUEST_TIMEOUT` without also raising `SBCL_TIMEOUT`, the client
-auto-adjusts its own wait to `SBCL_REQUEST_TIMEOUT + 5` so it doesn't give up
-on exit code 2 right as the bridge's own timeout is about to report properly
-on exit code 3.
+Request never delivered (6–7) — a client-local failure, no bridge
+interaction happened for this attempt:
+
+- **6** — usage or preflight error
+  - Bad command-line usage, a missing `SBCL_BRIDGE_DIR`, or no live bridge
+	found watching it (the step-0 liveness check in §7 above). This means
+	**fix your setup** — retrying without changing anything will keep
+	failing the same way.
+
+- **7** — could not submit in time
+  - The request was fully formed locally, but the input slot never freed up
+	within the wait budget because another request stayed queued the whole
+	time. This means **the bridge is just busy** — retrying later, or
+	`ctl.sh interrupt`-ing whatever's queued, may help; nothing here is
+	broken.
+
+Two related distinctions are worth internalizing:
+
+- **Exit 2 vs. exit 3**: 2 is this *script* giving up waiting; 3 is the
+  *bridge* reporting that it gave up evaluating. If you set
+  `SBCL_REQUEST_TIMEOUT` without also raising `SBCL_TIMEOUT`, the client
+  auto-adjusts its own wait to `SBCL_REQUEST_TIMEOUT + 5` so it doesn't
+  give up on exit 2 right as the bridge's own timeout is about to report
+  properly on exit 3.
+
+- **Exit 6 vs. exit 7**: both mean nothing was evaluated, but 6 is a
+  *setup* problem (nothing will change on retry until you fix it) and 7 is
+  *contention* (the bridge is healthy but occupied, and simply retrying,
+  waiting, or raising `SBCL_TIMEOUT` may well succeed next time).
 
 ---
 
@@ -1059,11 +1132,32 @@ Worth internalizing before you rely on this in production:
 
 ## 10. Troubleshooting
 
-- **`sbcl-client.sh` exits 2 ("timed out ...")**
-  - Either the bridge isn't running (`ctl.sh status`), the request is still
-	genuinely executing, or the input slot never freed up because an earlier
-	request stayed queued the whole time (the error message says which) —
-	raise `SBCL_TIMEOUT`, or check whether something needs `ctl.sh interrupt`.
+- **`sbcl-client.sh` exits 6 with "No bridge appears to be running" /
+  "Stale .sbcl-bridge.pid" / "doesn't look like an sbcl process"**
+  - The client's preflight liveness check (§7, step 0) caught the problem
+	before ever submitting anything — nothing was evaluated, and nothing was
+	lost. Run `ctl.sh status` to see what's actually going on, and `ctl.sh
+	start` if nothing is running. The "doesn't look like an sbcl process"
+	variant means the pid in `.sbcl-bridge.pid` is alive but isn't `sbcl` —
+	almost always a stale pidfile whose original process crashed and whose
+	pid the OS has since recycled for something unrelated; `ctl.sh start`
+	(which removes a stale pidfile before launching) resolves it.
+
+- **`sbcl-client.sh` exits 7 ("timed out ... waiting for the input slot")**
+  - The request was never delivered: another request stayed queued,
+	unclaimed, for the whole wait budget. The bridge is alive and busy, not
+	broken — raise `SBCL_TIMEOUT`, wait and retry, or `ctl.sh interrupt`
+	whatever's occupying it if it shouldn't be taking this long.
+
+- **`sbcl-client.sh` exits 2 ("timed out ... waiting for response")**
+  - The request **was** delivered (the client's preflight check already
+	ruled out "not running at all", and exit 7 already covers "never got
+	past the queue") — this means either the evaluation is still genuinely
+	running, or the bridge died *during* the wait (after passing the
+	preflight check but before or while processing the request). Raise
+	`SBCL_TIMEOUT` if it's just slow, check whether something needs `ctl.sh
+	interrupt`, or run `ctl.sh status` to rule out the bridge having died —
+	it'll show `STOPPED` in that case.
 
 - **`ctl.sh suspend` reports "did not complete ... withdrawn"**
   - A long-running request was in flight and the suspend request was still
@@ -1177,11 +1271,13 @@ cat > next-sbcl-input.lisp << 'EOF'
 EOF
 ```
 
-Client exit codes:
+Client exit codes (§7 has the full contract):
 
 - **0** — ok
-- **1** — evaluation error
-- **2** — client gave up waiting, to submit or for a response (`SBCL_TIMEOUT`)
+- **1** — evaluation error (`status=error`)
+- **2** — submitted, but no response within `SBCL_TIMEOUT`
 - **3** — bridge-side timeout (`SBCL_REQUEST_TIMEOUT`)
 - **4** — cancelled (`ctl.sh interrupt`)
 - **5** — fatal non-error condition
+- **6** — usage / preflight error — never submitted, fix your setup
+- **7** — couldn't submit within `SBCL_TIMEOUT` — bridge just busy, retry

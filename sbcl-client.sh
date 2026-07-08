@@ -15,10 +15,18 @@
 #   SBCL_TIMEOUT         total seconds THIS SCRIPT waits -- covering both
 #                        queueing the request (if another one is still
 #                        pending) and receiving its response (default:
-#                        30, or REQUEST_TIMEOUT+5 if that's set and larger)
+#                        30, or the effective evaluation timeout + 5 if
+#                        that's larger; see "Embedded headers" below)
 #   SBCL_REQUEST_TIMEOUT seconds the BRIDGE allows the evaluation itself to
 #                        run before giving up (default: bridge's own
 #                        default, currently 30s). Use "none" to disable.
+#
+# Before submitting anything, this script checks that SBCL_BRIDGE_DIR
+# actually looks like it's being watched by a live bridge (a
+# .sbcl-bridge.pid naming a running, sbcl-like process) -- a directory
+# existing is not evidence of that, and submitting against a dead
+# bridge would otherwise just sit until SBCL_TIMEOUT and report a
+# misleading "timed out" rather than "nothing is running here".
 #
 # Requests are submitted by hard-linking into place: if a previous
 # request is still queued and unclaimed, this script waits for the slot
@@ -31,10 +39,40 @@
 # SBCL_REQUEST_TIMEOUT, when set, takes precedence over an embedded
 # TIMEOUT header.
 #
-# Exit codes: 0 ok, 1 evaluation error, 2 gave up within SBCL_TIMEOUT
-# (either the input slot never freed up, or no response arrived),
-# 3 evaluation timed out (bridge-side), 4 evaluation was cancelled,
-# 5 a fatal (non-error) condition occurred bridge-side.
+# Exit codes. This is a deliberate, disjoint scheme meant to be a
+# stable contract for scripted/agent callers -- each code means
+# exactly one thing, never two. Codes 0-5 mean the bridge received the
+# request and reported an outcome for it; codes 6-7 mean the request
+# was never delivered to the bridge at all (nothing was evaluated, and
+# there is no BEGIN-OUTPUT/END-OUTPUT pair to look for in the log for
+# this attempt).
+#
+#   0  ok                        -- bridge reported status=ok
+#   1  evaluation error          -- bridge reported status=error
+#   2  no response in time       -- request WAS submitted, but no
+#                                    response arrived within the wait
+#                                    budget (SBCL_TIMEOUT or the
+#                                    computed default); the bridge may
+#                                    still be working on it
+#   3  bridge-side timeout       -- bridge reported status=timeout
+#                                    (SBCL_REQUEST_TIMEOUT / embedded
+#                                    TIMEOUT header expired)
+#   4  cancelled                 -- bridge reported status=cancelled
+#                                    (via ctl.sh interrupt)
+#   5  fatal condition           -- bridge reported status=fatal-condition
+#   6  usage / preflight error   -- nothing was ever submitted: bad
+#                                    command-line usage, a missing
+#                                    SBCL_BRIDGE_DIR, or no live bridge
+#                                    found watching it
+#   7  could not submit in time  -- the request was fully formed
+#                                    locally but the input slot never
+#                                    freed up within the wait budget
+#                                    (another request stayed queued the
+#                                    whole time); still nothing evaluated
+#
+# The 6/7 split matters operationally: 6 means "fix your setup" (the
+# retry will keep failing until you do), 7 means "the bridge is just
+# busy" (retrying later, or interrupting whatever's queued, may help).
 
 set -euo pipefail
 
@@ -99,8 +137,10 @@ Leading ';;; REQID: <id>' and ';;; TIMEOUT: <seconds|none>' header
 comments embedded in the submitted code are honored: the id is reused,
 and the timeout both reaches the bridge and extends this script's wait
 budget. SBCL_REQUEST_TIMEOUT overrides an embedded TIMEOUT header.
+
+Exit codes: see the comment block at the top of this script.
 EOF
-  exit 1
+  exit 6
 }
 
 [ $# -ge 1 ] || usage
@@ -115,7 +155,7 @@ case "$mode" in
     ;;
   file)
     [ $# -eq 1 ] || usage
-    [ -f "$1" ] || { echo "No such file: $1" >&2; exit 1; }
+    [ -f "$1" ] || { echo "No such file: $1" >&2; exit 6; }
     CODE="$(cat "$1")"
     ;;
   -)
@@ -128,7 +168,39 @@ esac
 
 if [ ! -d "$SBCL_BRIDGE_DIR" ]; then
   echo "Bridge directory does not exist: $SBCL_BRIDGE_DIR" >&2
-  exit 1
+  exit 6
+fi
+
+# A directory existing is not evidence a bridge is actually watching it
+# -- it could be an empty/unrelated directory, or one whose bridge
+# crashed or was stopped hours ago. Without this check, a submission
+# against a dead bridge would sit silently until SBCL_TIMEOUT expired
+# and only then report the unhelpful "timed out waiting for response"
+# (exit 2), instead of the real problem (exit 6). Mirrors (a
+# deliberately lighter version of) sbcl-bridge-ctl.sh's own is_running:
+# PID file present, process alive, and -- to catch a PID recycled by an
+# unrelated process after a crash -- looking like sbcl at all. This is
+# a liveness check, not a guarantee: the bridge can still crash, hang,
+# or belong to a different SBCL_BRIDGE_LISP between this check and the
+# actual submission. Keep in sync with is_running() in
+# sbcl-bridge-ctl.sh if that logic changes.
+PID_FILE="$SBCL_BRIDGE_DIR/.sbcl-bridge.pid"
+if [ ! -f "$PID_FILE" ]; then
+  echo "No bridge appears to be running against $SBCL_BRIDGE_DIR (no .sbcl-bridge.pid)." >&2
+  echo "Start one with: sbcl-bridge-ctl.sh start" >&2
+  exit 6
+fi
+BRIDGE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+if [ -z "$BRIDGE_PID" ] || ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+  echo "Stale .sbcl-bridge.pid in $SBCL_BRIDGE_DIR (pid '${BRIDGE_PID:-<empty>}' not running)." >&2
+  echo "Start (or restart) the bridge with: sbcl-bridge-ctl.sh start" >&2
+  exit 6
+fi
+if [ -r "/proc/$BRIDGE_PID/cmdline" ] \
+   && ! tr '\0' ' ' < "/proc/$BRIDGE_PID/cmdline" 2>/dev/null | grep -qE 'sbcl|\.core'; then
+  echo "pid $BRIDGE_PID in $PID_FILE doesn't look like an sbcl process (stale/recycled pid?)." >&2
+  echo "Check with: sbcl-bridge-ctl.sh status" >&2
+  exit 6
 fi
 
 [ -f "$OUTPUT_LOG" ] || touch "$OUTPUT_LOG"
@@ -204,14 +276,17 @@ START_SIZE=$(wc -c < "$OUTPUT_LOG")
 # the bridge is never silently overwritten (which would leave its
 # client waiting forever). If the slot is busy, poll until the bridge
 # claims the queued request, within the same overall TIMEOUT budget as
-# the response wait below.
+# the response wait below. This loop exits 7, not 2, on giving up:
+# nothing was ever delivered to the bridge, which is a categorically
+# different (and to a caller, actionable-differently) outcome than
+# "delivered but no response yet".
 elapsed=0
 until ln "$TMP_FILE" "$INPUT_FILE" 2>/dev/null; do
   sleep "$POLL_INTERVAL"
   elapsed=$(awk -v e="$elapsed" -v p="$POLL_INTERVAL" 'BEGIN { printf "%.2f", e + p }')
   if awk -v e="$elapsed" -v t="$TIMEOUT" 'BEGIN { exit !(e >= t) }'; then
     echo "ERROR: timed out after ${TIMEOUT}s waiting for the input slot to free up (another request is still queued) id=${REQID}" >&2
-    exit 2
+    exit 7
   fi
 done
 rm -f "$TMP_FILE"

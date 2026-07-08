@@ -77,6 +77,32 @@ unset SBCL_HOME
 "$CTL" start >/dev/null || { echo "FATAL: bridge failed to start; check $SBCL_BRIDGE_DIR/sbcl-output.log"; exit 1; }
 sleep 0.7
 
+# --- Client preflight checks (before any bridge is running) ----------
+#
+# These deliberately run in a SEPARATE, throwaway directory: the real
+# $SBCL_BRIDGE_DIR is about to have a live bridge started in it a few
+# lines down, which would defeat the "no bridge running" checks below.
+
+PREFLIGHT_DIR="$(mktemp -d)"
+
+expect_exit "client refuses a nonexistent bridge directory (exit 6)" 6 \
+  env SBCL_BRIDGE_DIR="$PREFLIGHT_DIR/does-not-exist" "$CLIENT" eval '(+ 1 1)'
+
+expect_exit "client refuses a directory with no .sbcl-bridge.pid (exit 6)" 6 \
+  env SBCL_BRIDGE_DIR="$PREFLIGHT_DIR" "$CLIENT" eval '(+ 1 1)'
+
+echo 999999 > "$PREFLIGHT_DIR/.sbcl-bridge.pid"
+expect_exit "client refuses a stale (not-running) pid (exit 6)" 6 \
+  env SBCL_BRIDGE_DIR="$PREFLIGHT_DIR" "$CLIENT" eval '(+ 1 1)'
+
+sleep 999 &
+UNRELATED_PID=$!
+echo "$UNRELATED_PID" > "$PREFLIGHT_DIR/.sbcl-bridge.pid"
+expect_exit "client refuses a pid that isn't sbcl-like (recycled pid, exit 6)" 6 \
+  env SBCL_BRIDGE_DIR="$PREFLIGHT_DIR" "$CLIENT" eval '(+ 1 1)'
+kill "$UNRELATED_PID" 2>/dev/null || true
+rm -rf "$PREFLIGHT_DIR"
+
 # --- Basic evaluation ------------------------------------------------
 
 if "$CLIENT" eval '(+ 40 2)' 2>/dev/null | grep -q '^;;; => 42$'; then
@@ -172,6 +198,29 @@ if wait "$Q1" && wait "$Q2"; then
 else
   bad "second caller queues behind an in-flight request"
 fi
+
+# A caller with a short SBCL_TIMEOUT that gives up before the slot ever
+# frees must get exit 7 (couldn't submit) -- distinct from exit 2
+# (submitted, no response). This needs the input SLOT itself occupied
+# by an unclaimed request, not just the bridge being busy: the bridge
+# claims (moves next-sbcl-input.lisp -> .working) almost instantly, so
+# a lone submission during a long-running request typically still
+# lands cleanly and then times out waiting for a RESPONSE (exit 2) --
+# that path is already covered above. To occupy the slot itself we
+# need a QUEUED-BEHIND request: an occupant to tie up evaluation, a
+# second request that lands in next-sbcl-input.lisp and can't be
+# claimed while the occupant runs, and only then a third, impatient
+# caller whose ln(1) genuinely fails for the occupant's whole duration.
+"$CLIENT" eval '(progn (sleep 3) :occupant)' >/dev/null 2>&1 &
+Q_OCC=$!
+sleep 0.3
+"$CLIENT" eval ':queued-behind' >/dev/null 2>&1 &
+Q_QUEUED=$!
+sleep 0.3
+expect_exit "caller gives up queueing when the slot stays busy (exit 7)" 7 \
+  env SBCL_TIMEOUT=1 "$CLIENT" eval ':impatient'
+wait "$Q_OCC" 2>/dev/null || true
+wait "$Q_QUEUED" 2>/dev/null || true
 
 "$CLIENT" eval '(progn (sleep 2) :busy)' >/dev/null 2>&1 &
 Q3=$!
