@@ -657,6 +657,69 @@ fi
 save_bridge_logs "same-dir-resume" "$SLASH_DIR"
 rm -rf "$SLASH_DIR"
 
+# --- SBCL_BRIDGE_DIR with a trailing slash must never produce double
+# --- slashes anywhere: ctl.sh's own messages, log output, or saved
+# --- core paths.
+#
+# A real bug, found via a log line in production:
+#   ;;; SUSPENDING to /workspace/sbcl-bridge//cores/bridge-....core
+# SBCL_BRIDGE_DIR=/foo/bar/ is not an unreasonable thing for a caller
+# to write, and every path in both ctl.sh and client.sh was built by
+# plain string concatenation ("$BRIDGE_DIR/whatever") directly from
+# whatever the caller supplied -- so a trailing slash in the input
+# propagated into every single derived path. Harmless to the
+# filesystem (POSIX collapses repeated slashes identically to one) but
+# an avoidable, ugly rough edge that both scripts now close by
+# normalizing the directory once, immediately, before anything else
+# derives a path from it -- see the comment at the top of
+# sbcl-bridge-ctl.sh.
+#
+# This checks ctl.sh's OWN suspend output directly (captured, not
+# discarded), not just sbcl-output.log -- deliberately, because the
+# Lisp side's independent pathname normalization (ensure-directory-
+# pathname on the way in, and suspend-bridge's own core-path coercion)
+# would clean up a double slash before it ever reached the log or an
+# actual saved filename, masking a regression in ctl.sh's OWN
+# construction specifically. ctl.sh's "Requesting suspend to
+# $core_path ..." line is built and printed before any of that -- it's
+# the one place a ctl.sh-only regression would be visible on its own.
+SLASHDIR_BASE="$(mktemp -d)"
+SLASHDIR_TRAILING="${SLASHDIR_BASE}/"
+if env SBCL_BRIDGE_DIR="$SLASHDIR_TRAILING" SBCL_BRIDGE_LISP="$SBCL_BRIDGE_LISP" "$CTL" start >/dev/null 2>&1; then
+  wait_for_bridge_ready "$SLASHDIR_BASE"
+  env SBCL_BRIDGE_DIR="$SLASHDIR_TRAILING" "$CLIENT" eval '(+ 1 1)' >/dev/null 2>&1
+  SUSPEND_OUTPUT="$(env SBCL_BRIDGE_DIR="$SLASHDIR_TRAILING" "$CTL" suspend 2>&1)"
+  echo "$SUSPEND_OUTPUT"
+
+  DOUBLE_SLASH_FOUND=0
+  if printf '%s' "$SUSPEND_OUTPUT" | grep -qF '//'; then
+    DOUBLE_SLASH_FOUND=1
+  fi
+  # Also check sbcl-output.log and the actual saved core filename, for
+  # broader coverage of the Lisp side (scoped to path-bearing lines,
+  # not a blanket check across the whole log -- the SBCL startup
+  # banner itself contains "http://www.sbcl.org/", which a blanket "//"
+  # check would misreport as a path bug).
+  if grep -E "SBCL-BRIDGE STARTED|SUSPENDING to" "$SLASHDIR_BASE/sbcl-output.log" 2>/dev/null \
+       | grep -qF '//'; then
+    DOUBLE_SLASH_FOUND=1
+  fi
+  for f in "$SLASHDIR_BASE"/cores/*.core; do
+    case "$f" in *//*) DOUBLE_SLASH_FOUND=1 ;; esac
+  done
+
+  if [ "$DOUBLE_SLASH_FOUND" -eq 0 ]; then
+    ok "a trailing slash in SBCL_BRIDGE_DIR never produces a double slash anywhere"
+  else
+    bad "a trailing slash in SBCL_BRIDGE_DIR never produces a double slash anywhere"
+  fi
+  env SBCL_BRIDGE_DIR="$SLASHDIR_TRAILING" "$CTL" stop >/dev/null 2>&1
+else
+  bad "a trailing slash in SBCL_BRIDGE_DIR never produces a double slash anywhere (bridge failed to start)"
+fi
+save_bridge_logs "trailing-slash-dir" "$SLASHDIR_BASE"
+rm -rf "$SLASHDIR_BASE"
+
 # Contrib REQUIRE after a resume: exercises the SBCL_HOME sidecar
 # restore. sb-posix must NOT have been loaded before the suspend for
 # this to be meaningful (the bridge itself only uses built-in modules).

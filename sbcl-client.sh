@@ -80,9 +80,6 @@ SBCL_BRIDGE_DIR="${SBCL_BRIDGE_DIR:-.}"
 POLL_INTERVAL="${SBCL_POLL_INTERVAL:-0.2}"
 REQUEST_TIMEOUT="${SBCL_REQUEST_TIMEOUT:-}"
 
-INPUT_FILE="$SBCL_BRIDGE_DIR/next-sbcl-input.lisp"
-OUTPUT_LOG="$SBCL_BRIDGE_DIR/sbcl-output.log"
-
 extract_code_header() {
   # extract_code_header KEY -- print the value of a leading
   # ';;; KEY: value' header line in $CODE and return 0, or return 1 if
@@ -170,6 +167,24 @@ if [ ! -d "$SBCL_BRIDGE_DIR" ]; then
   echo "Bridge directory does not exist: $SBCL_BRIDGE_DIR" >&2
   exit 6
 fi
+
+# Normalize to an absolute, symlink-resolved path now that we know it
+# exists (this is the earliest point 'cd' is guaranteed to succeed).
+# Every path below is built by plain string concatenation
+# ("$SBCL_BRIDGE_DIR/whatever"), so any imprecision here -- a
+# caller-supplied SBCL_BRIDGE_DIR with its own trailing slash, a
+# relative path, "." -- would otherwise propagate into every derived
+# path (INPUT_FILE, OUTPUT_LOG, PID_FILE, the mktemp template below).
+# Harmless to the filesystem itself (a double slash resolves
+# identically to a single one on any POSIX system), but avoidable, and
+# sbcl-bridge-ctl.sh normalizes BRIDGE_DIR the same way at the same
+# point in its own startup for the same reason -- see the comment
+# there for the log line that made this worth doing consistently
+# everywhere rather than only where it happened to be visible.
+SBCL_BRIDGE_DIR="$(cd "$SBCL_BRIDGE_DIR" && pwd)"
+
+INPUT_FILE="$SBCL_BRIDGE_DIR/next-sbcl-input.lisp"
+OUTPUT_LOG="$SBCL_BRIDGE_DIR/sbcl-output.log"
 
 # A directory existing is not evidence a bridge is actually watching it
 # -- it could be an empty/unrelated directory, or one whose bridge

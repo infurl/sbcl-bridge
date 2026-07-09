@@ -1112,30 +1112,42 @@ robust fix, when it's an option, is to load (via quickload or plain
 require) everything your workload needs BEFORE suspending -- once a
 contrib is loaded into the image, it's baked into the heap and never
 needs to be found on disk again after a resume."
-  (with-output-lock
-    (format t "~&;;; SUSPENDING to ~a~%" core-path)
-    (finish-output))
-  ;; save-lisp-and-die refuses to run with other threads alive.
-  #+sb-thread
-  (when *watchdog-thread*
-    (ignore-errors (sb-thread:terminate-thread *watchdog-thread*))
-    (ignore-errors (sb-thread:join-thread *watchdog-thread* :timeout 5 :default nil))
-    (setf *watchdog-thread* nil))
-  (write-version-sidecar core-path)
-  ;; Archive this request's own claimed file (next-sbcl-input.working)
-  ;; under its reqid now: save-lisp-and-die never returns, so
-  ;; run-bridge's usual post-request archive rename will never run for
-  ;; this request. Without this, every normal suspend would leave the
-  ;; working file behind to be archived as leftover-<ts>.lisp on
-  ;; resume. Done as late as possible -- after the sidecar, right
-  ;; before the save -- so that if anything above fails, the request
-  ;; errors out through the normal path with its working file still in
-  ;; place; and if the save itself fails, run-bridge's post-request
-  ;; rename is conditional on the working file still existing, so
-  ;; nothing conflicts.
-  (archive-own-request)
-  (sb-ext:gc :full t)
-  (sb-ext:save-lisp-and-die core-path
-                            :toplevel #'resume-bridge
-                            :executable t
-                            :save-runtime-options t))
+  ;; Normalize immediately: CORE-PATH arrives as whatever string the
+  ;; caller wrote into the request (typically sbcl-bridge-ctl.sh's own
+  ;; construction), and PATHNAME collapses artifacts like a doubled
+  ;; slash that plain string concatenation can introduce (e.g. a
+  ;; BRIDGE_DIR the caller supplied with its own trailing slash,
+  ;; concatenated with "/cores/..."). Coercing once here, up front,
+  ;; means the SUSPENDING log line, the .version sidecar path, and the
+  ;; path actually handed to SAVE-LISP-AND-DIE are all guaranteed to
+  ;; agree, rather than relying on some of those (VERSION-SIDECAR-PATH
+  ;; via NAMESTRING) normalizing implicitly while a plain ~A on the raw
+  ;; string elsewhere would not have.
+  (let ((core-path (pathname core-path)))
+    (with-output-lock
+      (format t "~&;;; SUSPENDING to ~a~%" core-path)
+      (finish-output))
+    ;; save-lisp-and-die refuses to run with other threads alive.
+    #+sb-thread
+    (when *watchdog-thread*
+      (ignore-errors (sb-thread:terminate-thread *watchdog-thread*))
+      (ignore-errors (sb-thread:join-thread *watchdog-thread* :timeout 5 :default nil))
+      (setf *watchdog-thread* nil))
+    (write-version-sidecar core-path)
+    ;; Archive this request's own claimed file (next-sbcl-input.working)
+    ;; under its reqid now: save-lisp-and-die never returns, so
+    ;; run-bridge's usual post-request archive rename will never run for
+    ;; this request. Without this, every normal suspend would leave the
+    ;; working file behind to be archived as leftover-<ts>.lisp on
+    ;; resume. Done as late as possible -- after the sidecar, right
+    ;; before the save -- so that if anything above fails, the request
+    ;; errors out through the normal path with its working file still in
+    ;; place; and if the save itself fails, run-bridge's post-request
+    ;; rename is conditional on the working file still existing, so
+    ;; nothing conflicts.
+    (archive-own-request)
+    (sb-ext:gc :full t)
+    (sb-ext:save-lisp-and-die core-path
+                              :toplevel #'resume-bridge
+                              :executable t
+                              :save-runtime-options t)))

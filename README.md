@@ -290,7 +290,7 @@ bridges it starts:
 ```bash
 ./sbcl-bridge-test.sh
 # ...
-# == 36 passed, 0 failed ==
+# == 37 passed, 0 failed ==
 #
 # Diagnostics bundle: /path/you/ran/this/from/sbcl-bridge-test-diagnostics-20260101-120000.tar.gz
 ```
@@ -1067,6 +1067,29 @@ invocation style.
   `paths-equal-p` (truename-based, so spelling differences like this one don't
   matter) used for the analogous `SBCL_HOME`/Quicklisp-home comparisons
   elsewhere in this tooling.
+
+  A fourth bug, also in this immediate area and also found via a log line in
+  production — `;;; SUSPENDING to /workspace/sbcl-bridge//cores/bridge-....core`
+  — is worth documenting for the same reason as the previous two:
+  `SBCL_BRIDGE_DIR` with a trailing slash (`SBCL_BRIDGE_DIR=/foo/bar/` is not
+  an unreasonable thing to write) used to propagate that trailing slash into
+  every path both `sbcl-bridge-ctl.sh` and `sbcl-client.sh` derive from it,
+  since each was built by plain string concatenation
+  (`"$BRIDGE_DIR/whatever"`) directly from whatever the caller
+  supplied. Harmless to the filesystem itself — a double slash resolves
+  identically to a single one on any POSIX system — but an avoidable, ugly
+  rough edge, and one that a previous fix for a related bug (the
+  `SBCL_BRIDGE_DIR`-on-resume override, above) had already partially addressed
+  without going far enough: it introduced a second, separately normalized
+  variable (`BRIDGE_DIR_ABS`) for use at just the couple of call sites that
+  fix specifically needed, while every *other* path in the script kept
+  building from the original, un-normalized `BRIDGE_DIR` — which is exactly
+  how a caller-supplied trailing slash could still reach a log line.  Both
+  scripts now normalize the directory to an absolute, symlink-resolved path
+  exactly once, immediately, in the *same* variable everything else already
+  used, before anything else derives a path from it — removing the possibility
+  of this mistake by removing the second variable, rather than by remembering
+  to use it everywhere.
 
   Beyond `SBCL_HOME` and the watched directory, one more category of
   moved-image risk exists but is **not** something `sbcl-bridge` itself can
