@@ -620,6 +620,43 @@ fi
 save_bridge_logs "moved-workspace" "$MOVED_DIR"
 rm -rf "$MOVED_DIR"
 
+# --- Resume into the SAME directory must not report a false "moved" --
+#
+# A real bug, not a hypothetical: a fresh `start` bakes in a trailing
+# slash (ctl.sh's cmd_start appends one explicitly to the directory
+# argument), but SBCL_BRIDGE_DIR as exported for a `resume` comes from
+# a plain `pwd`, which never has one. Comparing those two spellings
+# with a raw string/namestring compare instead of a normalized
+# (truename-based) one reports a spurious "SBCL_BRIDGE_DIR overrides
+# the directory saved in this image" on the FIRST resume after a fresh
+# start -- even though nothing actually moved -- and then, confusingly,
+# never again after that: the first (spurious) override overwrites the
+# saved directory with the no-trailing-slash spelling, which then
+# happens to match on every later resume regardless of whether the
+# environment has genuinely changed. This needs its own fresh
+# start/suspend/resume in an isolated directory to reproduce reliably:
+# by the time other tests in this suite reach a resume, an earlier one
+# may already have normalized the spelling away from the exact
+# trailing-slash mismatch this depends on.
+SLASH_DIR="$(mktemp -d)"
+if env SBCL_BRIDGE_DIR="$SLASH_DIR" SBCL_BRIDGE_LISP="$SBCL_BRIDGE_LISP" "$CTL" start >/dev/null 2>&1; then
+  wait_for_bridge_ready "$SLASH_DIR"
+  env SBCL_BRIDGE_DIR="$SLASH_DIR" "$CTL" suspend >/dev/null 2>&1
+  SIZE_BEFORE_SLASH_RESUME=$(wc -c < "$SLASH_DIR/sbcl-output.log" 2>/dev/null || echo 0)
+  env SBCL_BRIDGE_DIR="$SLASH_DIR" "$CTL" resume >/dev/null 2>&1
+  wait_for_bridge_ready "$SLASH_DIR" "$SIZE_BEFORE_SLASH_RESUME"
+  if tail -c +"$((SIZE_BEFORE_SLASH_RESUME + 1))" "$SLASH_DIR/sbcl-output.log" 2>/dev/null | grep -q "RESUME:"; then
+    bad "resume into the same directory reports no spurious 'overrides' message"
+  else
+    ok "resume into the same directory reports no spurious 'overrides' message"
+  fi
+  env SBCL_BRIDGE_DIR="$SLASH_DIR" "$CTL" stop >/dev/null 2>&1
+else
+  bad "resume into the same directory reports no spurious 'overrides' message (bridge failed to start)"
+fi
+save_bridge_logs "same-dir-resume" "$SLASH_DIR"
+rm -rf "$SLASH_DIR"
+
 # Contrib REQUIRE after a resume: exercises the SBCL_HOME sidecar
 # restore. sb-posix must NOT have been loaded before the suspend for
 # this to be meaningful (the bridge itself only uses built-in modules).

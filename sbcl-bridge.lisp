@@ -1000,10 +1000,26 @@ Only the directory is treated this way. *bridge-poll-interval*,
 *bridge-default-timeout*, and *bridge-backtrace-frames* are ordinary
 session configuration rather than anything location-dependent, so they
 continue to carry over from the saved image unconditionally -- see
-their docstrings."
+their docstrings.
+
+The comparison against the saved directory goes through PATHS-EQUAL-P
+(truename-based), not a raw string/namestring comparison, precisely
+because the two sides routinely have equivalent-but-differently-spelled
+values that a plain string compare would treat as different: a fresh
+start bakes in a trailing slash (sbcl-bridge-ctl.sh's cmd_start appends
+one explicitly), but SBCL_BRIDGE_DIR as exported for a resume comes
+from a plain `pwd`, which never has one. Without normalizing, a resume
+onto the SAME directory a fresh start used would print a spurious
+'overrides the directory saved in this image' message -- generally
+harmless, but confusing, and once misleading enough to be worth
+avoiding: after that first (spurious) override fired, *bridge-directory*
+would be overwritten with the no-trailing-slash SBCL_BRIDGE_DIR string,
+which would then happen to string-match on every SUBSEQUENT resume,
+making the message appear exactly once and never again even though
+nothing about the environment had actually changed."
   (let ((dir-override (sb-ext:posix-getenv "SBCL_BRIDGE_DIR")))
     (when (and dir-override (plusp (length dir-override))
-               (not (equal dir-override (ignore-errors (namestring *bridge-directory*)))))
+               (not (paths-equal-p dir-override *bridge-directory*)))
       (with-output-lock
         (format t "~&;;; RESUME: SBCL_BRIDGE_DIR=~a overrides the directory saved in this ~
 image (~a)~%"

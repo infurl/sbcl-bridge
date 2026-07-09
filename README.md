@@ -18,11 +18,11 @@ the system. It covers four files:
 
 - `sbcl-bridge-test.sh`
   - End-to-end smoke test: spins up a throwaway bridge in a temp directory and
-	exercises every major behavior in ~60 seconds. Run it after any SBCL
-	upgrade or change to the bridge itself. Every run — pass or fail — leaves
-	a `sbcl-bridge-test-diagnostics-<timestamp>.tar.gz` in the directory it
-	was invoked from (see §3.1); handing that file over is usually enough to
-	debug a failure on a machine nobody else can log into.
+    exercises every major behavior in ~60 seconds. Run it after any SBCL
+    upgrade or change to the bridge itself. Every run — pass or fail — leaves
+    a `sbcl-bridge-test-diagnostics-<timestamp>.tar.gz` in the directory it
+    was invoked from (see §3.1); handing that file over is usually enough to
+    debug a failure on a machine nobody else can log into.
 
 > **Provenance and AI Disclosure**
 >
@@ -203,7 +203,7 @@ Every request produces a block in `sbcl-output.log` that looks like this:
   - `timeout` The request exceeded its timeout (see §8.1).
   - `cancelled` The request was interrupted via `ctl.sh interrupt` (see §8.2).
   - `fatal-condition` A non-`ERROR` `SERIOUS-CONDITION` occurred,
-	e.g. `STORAGE-CONDITION` (heap/stack exhaustion) (see §8.3).
+    e.g. `STORAGE-CONDITION` (heap/stack exhaustion) (see §8.3).
 
 `error` and `fatal-condition` responses also include a bracketed backtrace
 (see §8.3):
@@ -290,7 +290,7 @@ bridges it starts:
 ```bash
 ./sbcl-bridge-test.sh
 # ...
-# == 35 passed, 0 failed ==
+# == 36 passed, 0 failed ==
 #
 # Diagnostics bundle: /path/you/ran/this/from/sbcl-bridge-test-diagnostics-20260101-120000.tar.gz
 ```
@@ -470,62 +470,62 @@ enumerated, disjoint contract.
 
 - `start`
   - Cold-starts a fresh SBCL process running `run-bridge`. No-op (with a
-	message) if already running. SBCL is always started with `--no-sysinit
-	--no-userinit`: the bridge must behave identically in a bare container and
-	on a developer desktop, and a stray `/etc/sbclrc` or `~/.sbclrc` that
-	loads Quicklisp, changes `*print-*` settings, or merely prints something
-	would make evaluation results environment-dependent (and could corrupt the
-	marker protocol). Anything an init file would have provided can be loaded
-	explicitly as an ordinary first request instead — which also means it's
-	captured in the input log and, unlike an init file, becomes image state
-	that survives suspend/resume. (`resume` never processes init files either:
-	the saved image's custom toplevel bypasses the startup sequence that would
-	read them, and the version probe used for core-compatibility checks runs
-	with the same flags.)
+    message) if already running. SBCL is always started with `--no-sysinit
+    --no-userinit`: the bridge must behave identically in a bare container and
+    on a developer desktop, and a stray `/etc/sbclrc` or `~/.sbclrc` that
+    loads Quicklisp, changes `*print-*` settings, or merely prints something
+    would make evaluation results environment-dependent (and could corrupt the
+    marker protocol). Anything an init file would have provided can be loaded
+    explicitly as an ordinary first request instead — which also means it's
+    captured in the input log and, unlike an init file, becomes image state
+    that survives suspend/resume. (`resume` never processes init files either:
+    the saved image's custom toplevel bypasses the startup sequence that would
+    read them, and the version probe used for core-compatibility checks runs
+    with the same flags.)
 
 - `stop`
   - Sends `SIGTERM`, waits up to `SBCL_STOP_TIMEOUT`, escalates to `SIGKILL`
-	if needed.
+    if needed.
 
 - `restart`
   - `stop` then `start`.
 
 - `status`
   - Reports running/stopped, PID, uptime, RSS/VSZ memory, saved core images,
-	log sizes, and the number of archived request files. The RUNNING check
-	verifies (via `/proc/<pid>/cmdline`, where available) that the recorded
-	PID actually belongs to an sbcl process or a `*.core` image, so a PID
-	recycled by an unrelated process after a crash reads as STOPPED instead of
-	RUNNING — and can't be `SIGTERM`ed by `stop`. Also triggers cheap
-	housekeeping: a size-based log-rotation check (see §8.5) and pruning of
-	`processed/` down to `SBCL_PROCESSED_RETAIN` files, so anything that polls
-	`status` keeps both bounded for free.
+    log sizes, and the number of archived request files. The RUNNING check
+    verifies (via `/proc/<pid>/cmdline`, where available) that the recorded
+    PID actually belongs to an sbcl process or a `*.core` image, so a PID
+    recycled by an unrelated process after a crash reads as STOPPED instead of
+    RUNNING — and can't be `SIGTERM`ed by `stop`. Also triggers cheap
+    housekeeping: a size-based log-rotation check (see §8.5) and pruning of
+    `processed/` down to `SBCL_PROCESSED_RETAIN` files, so anything that polls
+    `status` keeps both bounded for free.
 
 - `suspend [core-path]`
   - Saves an executable core image and stops the process (see §8.4). Defaults
-	to `cores/bridge-<timestamp>.core`.
+    to `cores/bridge-<timestamp>.core`.
 
 - `resume [core-path]`
   - Resumes from a saved core image. Defaults to the most recent one in
-	`cores/`. Watches `SBCL_BRIDGE_DIR` (always exported for the resumed
-	process, as an absolute path), not necessarily the directory baked into
-	the image at suspend time — see "Moved workspaces" in §8.4.
+    `cores/`. Watches `SBCL_BRIDGE_DIR` (always exported for the resumed
+    process, as an absolute path), not necessarily the directory baked into
+    the image at suspend time — see "Moved workspaces" in §8.4.
 
 - `interrupt [reqid]`
   - Cancels whatever request is currently running, or a specific one by id
-	(see §8.2).
+    (see §8.2).
 
 - `logs [-f] [lines]`
   - Prints the last N lines (default 50) of `sbcl-output.log` for this
-	`SBCL_BRIDGE_DIR`, or follows it live with `-f` (like `tail -f`). Purely a
-	convenience so you don't have to compose the log path by hand.
+    `SBCL_BRIDGE_DIR`, or follows it live with `-f` (like `tail -f`). Purely a
+    convenience so you don't have to compose the log path by hand.
 
 - `rotate-logs [--force]`
   - Rotates logs now. Without `--force`, only rotates logs that have actually
-	exceeded `SBCL_LOG_MAX_BYTES`, and never while a request is queued or in
-	flight (so a waiting client can't have the log truncated out from under it
-	— see §8.5). `--force` rotates regardless of size *and* busyness, with a
-	warning if a request is in flight.
+    exceeded `SBCL_LOG_MAX_BYTES`, and never while a request is queued or in
+    flight (so a waiting client can't have the log truncated out from under it
+    — see §8.5). `--force` rotates regardless of size *and* busyness, with a
+    warning if a request is in flight.
 
 ### Environment variables
 
@@ -540,15 +540,15 @@ enumerated, disjoint contract.
 
 - `SBCL_CORE_RETAIN` — default `3`
   - Number of suspended core images to keep; oldest are pruned after a
-	successful new suspend. Pruning also removes orphaned `.version` sidecars
-	(a sidecar is written just *before* `save-lisp-and-die`, so a failed save
-	can leave one behind with no matching core).
+    successful new suspend. Pruning also removes orphaned `.version` sidecars
+    (a sidecar is written just *before* `save-lisp-and-die`, so a failed save
+    can leave one behind with no matching core).
 
 - `SBCL_PROCESSED_RETAIN` — default `200`
   - Number of archived request files (`processed/*.lisp`, including `error-*`
-	and `leftover-*`) to keep; the oldest beyond that are pruned on every
-	`status` call. Nothing bridge-side ever deletes archives, so without this
-	an agent hammering the bridge would accumulate them without bound.
+    and `leftover-*`) to keep; the oldest beyond that are pruned on every
+    `status` call. Nothing bridge-side ever deletes archives, so without this
+    an agent hammering the bridge would accumulate them without bound.
 
 - `SBCL_STOP_TIMEOUT` — default `10`
   - Seconds to wait for graceful exit before `SIGKILL` on `stop`.
@@ -588,11 +588,11 @@ The client:
    - fails if `SBCL_BRIDGE_DIR` doesn't exist at all;
    - fails if there's no `.sbcl-bridge.pid` in it;
    - fails if the recorded pid isn't `kill -0`-alive (a stale pidfile from a
-	 crashed or manually-`kill`ed process);
+     crashed or manually-`kill`ed process);
    - fails if, per `/proc/<pid>/cmdline` where readable, the alive process
-	 doesn't look like `sbcl` at all — guarding against the same PID-reuse
-	 edge case `ctl.sh status` guards against (§9): a crash followed by the OS
-	 recycling that pid for an unrelated process.
+     doesn't look like `sbcl` at all — guarding against the same PID-reuse
+     edge case `ctl.sh status` guards against (§9): a crash followed by the OS
+     recycling that pid for an unrelated process.
 
    Each failure prints a specific reason and exits 6, pointing at `ctl.sh
    start` where that's the likely fix. This is a **liveness check, not a
@@ -682,12 +682,12 @@ requests you want to tell apart later.
 - `SBCL_TIMEOUT` — default larger of `30` or the effective evaluation
   timeout + 5 (from `SBCL_REQUEST_TIMEOUT` or an embedded `TIMEOUT` header)
   - Total seconds *this script* waits before giving up — the budget covers
-	both queueing the request (if the input slot is busy) and receiving the
-	response. Setting it to the empty string is the same as leaving it unset.
+    both queueing the request (if the input slot is busy) and receiving the
+    response. Setting it to the empty string is the same as leaving it unset.
 
 - `SBCL_REQUEST_TIMEOUT` — default unset, use bridge default
   - Seconds the *bridge* allows the evaluation itself to run. `none` disables
-	it for this request.
+    it for this request.
 
 ### Exit codes
 
@@ -707,13 +707,13 @@ Bridge reported an outcome (0–5):
 
 - **2** — no response in time
   - The request **was** successfully submitted, but no response arrived within
-	the wait budget (`SBCL_TIMEOUT`, or the computed default). The bridge may
-	still be working on it — this is this *script* giving up waiting, not the
-	bridge reporting a timeout (see the note on exit 3 below).
+    the wait budget (`SBCL_TIMEOUT`, or the computed default). The bridge may
+    still be working on it — this is this *script* giving up waiting, not the
+    bridge reporting a timeout (see the note on exit 3 below).
 
 - **3** — `status=timeout`
   - The bridge-side per-request timeout expired (`SBCL_REQUEST_TIMEOUT` or an
-	embedded `TIMEOUT` header).
+    embedded `TIMEOUT` header).
 
 - **4** — `status=cancelled`
   - Cancelled via `ctl.sh interrupt`.
@@ -726,15 +726,15 @@ happened for this attempt:
 
 - **6** — usage or preflight error
   - Bad command-line usage, a missing `SBCL_BRIDGE_DIR`, or no live bridge
-	found watching it (the step-0 liveness check in §7 above). This means
-	**fix your setup** — retrying without changing anything will keep failing
-	the same way.
+    found watching it (the step-0 liveness check in §7 above). This means
+    **fix your setup** — retrying without changing anything will keep failing
+    the same way.
 
 - **7** — could not submit in time
   - The request was fully formed locally, but the input slot never freed up
-	within the wait budget because another request stayed queued the whole
-	time. This means **the bridge is just busy** — retrying later, or `ctl.sh
-	interrupt`-ing whatever's queued, may help; nothing here is broken.
+    within the wait budget because another request stayed queued the whole
+    time. This means **the bridge is just busy** — retrying later, or `ctl.sh
+    interrupt`-ing whatever's queued, may help; nothing here is broken.
 
 Two related distinctions are worth internalizing:
 
@@ -1049,6 +1049,24 @@ invocation style.
   rather than trying to get `merge-pathnames` to strip them), and every
   directory argument in the bridge — fresh start, resume, and this override —
   goes through it.
+
+  A third bug turned up in this same small area, worth documenting for the
+  same reason as the second: the check for *whether* to apply the override
+  originally compared `SBCL_BRIDGE_DIR` against the directory saved in the
+  image as raw strings, which routinely differ in spelling even when they name
+  the exact same directory — a fresh `start` bakes in a trailing slash
+  (`cmd_start` appends one explicitly), but `SBCL_BRIDGE_DIR` as exported for
+  a `resume` comes from a plain `pwd`, which never has one. The practical
+  effect: resuming into the *same* directory a fresh start had just used would
+  print a spurious `RESUME: SBCL_BRIDGE_DIR=... overrides the directory saved
+  in this image` line — confusing on its own, and doubly so because it then
+  went away on every *subsequent* resume, since that first spurious override
+  overwrote the saved directory with the no-trailing-slash spelling, which
+  then happened to string-match from then on regardless of whether the
+  environment had actually changed. The comparison now goes through the same
+  `paths-equal-p` (truename-based, so spelling differences like this one don't
+  matter) used for the analogous `SBCL_HOME`/Quicklisp-home comparisons
+  elsewhere in this tooling.
 
   Beyond `SBCL_HOME` and the watched directory, one more category of
   moved-image risk exists but is **not** something `sbcl-bridge` itself can
@@ -1444,120 +1462,120 @@ Worth internalizing before you rely on this in production:
 - **`sbcl-client.sh` exits 6 with "No bridge appears to be running" / "Stale
   .sbcl-bridge.pid" / "doesn't look like an sbcl process"**
   - The client's preflight liveness check (§7, step 0) caught the problem
-	before ever submitting anything — nothing was evaluated, and nothing was
-	lost. Run `ctl.sh status` to see what's actually going on, and `ctl.sh
-	start` if nothing is running. The "doesn't look like an sbcl process"
-	variant means the pid in `.sbcl-bridge.pid` is alive but isn't `sbcl` —
-	almost always a stale pidfile whose original process crashed and whose pid
-	the OS has since recycled for something unrelated; `ctl.sh start` (which
-	removes a stale pidfile before launching) resolves it.
+    before ever submitting anything — nothing was evaluated, and nothing was
+    lost. Run `ctl.sh status` to see what's actually going on, and `ctl.sh
+    start` if nothing is running. The "doesn't look like an sbcl process"
+    variant means the pid in `.sbcl-bridge.pid` is alive but isn't `sbcl` —
+    almost always a stale pidfile whose original process crashed and whose pid
+    the OS has since recycled for something unrelated; `ctl.sh start` (which
+    removes a stale pidfile before launching) resolves it.
 
 - **`sbcl-client.sh` exits 7 ("timed out ... waiting for the input slot")**
   - The request was never delivered: another request stayed queued, unclaimed,
-	for the whole wait budget. The bridge is alive and busy, not broken —
-	raise `SBCL_TIMEOUT`, wait and retry, or `ctl.sh interrupt` whatever's
-	occupying it if it shouldn't be taking this long.
+    for the whole wait budget. The bridge is alive and busy, not broken —
+    raise `SBCL_TIMEOUT`, wait and retry, or `ctl.sh interrupt` whatever's
+    occupying it if it shouldn't be taking this long.
 
 - **`sbcl-client.sh` exits 2 ("timed out ... waiting for response")**
   - The request **was** delivered (the client's preflight check already ruled
-	out "not running at all", and exit 7 already covers "never got past the
-	queue") — this means either the evaluation is still genuinely running, or
-	the bridge died *during* the wait (after passing the preflight check but
-	before or while processing the request). Raise `SBCL_TIMEOUT` if it's just
-	slow, check whether something needs `ctl.sh interrupt`, or run `ctl.sh
-	status` to rule out the bridge having died — it'll show `STOPPED` in that
-	case.
+    out "not running at all", and exit 7 already covers "never got past the
+    queue") — this means either the evaluation is still genuinely running, or
+    the bridge died *during* the wait (after passing the preflight check but
+    before or while processing the request). Raise `SBCL_TIMEOUT` if it's just
+    slow, check whether something needs `ctl.sh interrupt`, or run `ctl.sh
+    status` to rule out the bridge having died — it'll show `STOPPED` in that
+    case.
 
 - **`ctl.sh suspend` reports "did not complete ... withdrawn"**
   - A long-running request was in flight and the suspend request was still
-	waiting behind it when `SBCL_SUSPEND_TIMEOUT` expired. The queued suspend
-	has been removed, so the bridge will *not* suspend later by surprise; wait
-	for (or `interrupt`) the in-flight request and run `suspend` again,
-	possibly with a larger `SBCL_SUSPEND_TIMEOUT`.
+    waiting behind it when `SBCL_SUSPEND_TIMEOUT` expired. The queued suspend
+    has been removed, so the bridge will *not* suspend later by surprise; wait
+    for (or `interrupt`) the in-flight request and run `suspend` again,
+    possibly with a larger `SBCL_SUSPEND_TIMEOUT`.
 
 - **`ctl.sh start` says "Failed to start"**
   - Check `sbcl-output.log` directly for the SBCL-level error (e.g.
-	`sbcl-bridge.lisp` not found — check `SBCL_BRIDGE_LISP`).
+    `sbcl-bridge.lisp` not found — check `SBCL_BRIDGE_LISP`).
 
 - **`ctl.sh suspend` fails with a "multiple threads" error in the log**
   - Should not happen — `suspend-bridge` stops the watchdog thread first
-	automatically. If you see this, something loaded extra threads into the
-	image before suspending; check what else your submitted code may have
-	spawned.
+    automatically. If you see this, something loaded extra threads into the
+    image before suspending; check what else your submitted code may have
+    spawned.
 
 - **`ctl.sh resume` prints a version-mismatch warning**
   - Informational; the image is self-contained and often still works.  If it
-	then actually fails, you'll need to `start` fresh instead (state from that
-	particular suspend point is lost, but everything from before that suspend
-	point that made it into an earlier still-good core is not).
+    then actually fails, you'll need to `start` fresh instead (state from that
+    particular suspend point is lost, but everything from before that suspend
+    point that made it into an earlier still-good core is not).
 
 - **`;;; ERROR: Don't know how to REQUIRE <some-contrib>` after a resume, but
   the identical code works on a fresh `start`**
   - Handled automatically by resume's validated `SBCL_HOME` restoration — see
-	§8.4 — including the shared-workspace case where the core was suspended on
-	a *different machine* (host vs. container) whose sbcl lives at a different
-	prefix: `resume` detects that the sidecar's recorded path is unusable here
-	and restores the local installation's home instead. If you're still seeing
-	it: (1) confirm you resumed via `ctl.sh resume`, not by running the
-	`.core` file directly or via `sbcl --core ...` by hand — the restoration
-	lives in the shell script; (2) look for the resume-time `WARNING: no
-	usable SBCL_HOME found` message, which means neither the sidecar's path
-	nor the local sbcl's home exists here with a `contrib/` inside it; (3)
-	check whether an inherited `SBCL_HOME` in your environment is pointing
-	somewhere stale — a caller-provided value is respected even when it's
-	wrong (with a warning). Otherwise, load the failing library before
-	suspending next time.
+    §8.4 — including the shared-workspace case where the core was suspended on
+    a *different machine* (host vs. container) whose sbcl lives at a different
+    prefix: `resume` detects that the sidecar's recorded path is unusable here
+    and restores the local installation's home instead. If you're still seeing
+    it: (1) confirm you resumed via `ctl.sh resume`, not by running the
+    `.core` file directly or via `sbcl --core ...` by hand — the restoration
+    lives in the shell script; (2) look for the resume-time `WARNING: no
+    usable SBCL_HOME found` message, which means neither the sidecar's path
+    nor the local sbcl's home exists here with a `contrib/` inside it; (3)
+    check whether an inherited `SBCL_HOME` in your environment is pointing
+    somewhere stale — a caller-provided value is respected even when it's
+    wrong (with a warning). Otherwise, load the failing library before
+    suspending next time.
 
 - **A resumed bridge shows `RUNNING` and looks healthy, but requests submitted
   through `sbcl-client.sh` always time out (exit 2), and `sbcl-output.log`
   shows nothing beyond `SBCL-BRIDGE STARTED`**
   - Classic symptom of the resumed bridge watching a different directory than
-	the one you're submitting requests to — most often the shared-workspace
-	scenario in §8.4's "Moved workspaces": the core was suspended watching one
-	path and resumed where that path means something else (or nothing). Check
-	the `dir=` value on the `SBCL-BRIDGE STARTED` line in `sbcl-output.log`
-	against the `SBCL_BRIDGE_DIR` you're actually submitting requests against
-	— if they don't match, either `ctl.sh resume` wasn't given the right
-	`SBCL_BRIDGE_DIR` (remember it must be set *before* the `resume` command,
-	not just before the `eval` — the directory is fixed for the life of that
-	process), or you're running an older build of
-	`sbcl-bridge-ctl.sh`/`sbcl-bridge.lisp` predating this override existing
-	at all.
+    the one you're submitting requests to — most often the shared-workspace
+    scenario in §8.4's "Moved workspaces": the core was suspended watching one
+    path and resumed where that path means something else (or nothing). Check
+    the `dir=` value on the `SBCL-BRIDGE STARTED` line in `sbcl-output.log`
+    against the `SBCL_BRIDGE_DIR` you're actually submitting requests against
+    — if they don't match, either `ctl.sh resume` wasn't given the right
+    `SBCL_BRIDGE_DIR` (remember it must be set *before* the `resume` command,
+    not just before the `eval` — the directory is fixed for the life of that
+    process), or you're running an older build of
+    `sbcl-bridge-ctl.sh`/`sbcl-bridge.lisp` predating this override existing
+    at all.
 
 - **`(require "UIOP")` (or `ql:quickload`) fails inside a request even though
   `QUICKLISP_HOME` is set correctly**
   - Check `sbcl-output.log` for a `;;; QUICKLISP: ...` line from the most
-	recent start or resume (§8.7) — it explains exactly what happened:
-	`loaded, home=...` means Quicklisp is ready and this is a different
-	problem; `install failed: ...` or `could not find or download a
-	quicklisp.lisp installer` means no network reached `beta.quicklisp.org`
-	and none of `QUICKLISP_LISP`, the Debian/Ubuntu path, or a cached download
-	provided one either — see the network-access limitation in §9.  If you
-	don't see any `;;; QUICKLISP:` line at all, `QUICKLISP_HOME` wasn't
-	actually set in the environment the bridge process itself was started with
-	(double-check it's exported, and exported *before* `ctl.sh
-	start`/`resume`, not just before submitting the request).
+    recent start or resume (§8.7) — it explains exactly what happened:
+    `loaded, home=...` means Quicklisp is ready and this is a different
+    problem; `install failed: ...` or `could not find or download a
+    quicklisp.lisp installer` means no network reached `beta.quicklisp.org`
+    and none of `QUICKLISP_LISP`, the Debian/Ubuntu path, or a cached download
+    provided one either — see the network-access limitation in §9.  If you
+    don't see any `;;; QUICKLISP:` line at all, `QUICKLISP_HOME` wasn't
+    actually set in the environment the bridge process itself was started with
+    (double-check it's exported, and exported *before* `ctl.sh
+    start`/`resume`, not just before submitting the request).
 
 - **A stray `sbcl` process left over from a previous test**
   - `ps aux | grep sbcl-bridge.lisp`, then `kill` it — `ctl.sh stop` only
-	knows about the PID recorded in `.sbcl-bridge.pid` for *its*
-	`SBCL_BRIDGE_DIR`; a leftover process pointed at the same directory from
-	an earlier, differently-invoked session can race with a newly started
-	one. The telltale symptom: requests are claimed and archived normally but
-	*some* responses never appear in `sbcl-output.log` (roughly alternating,
-	since the two loops take turns winning the claim) — the losing bridge is
-	writing its responses to whatever its own stdout points at, which, if the
-	directory was deleted and recreated under it, is a deleted inode. This is
-	especially easy to trigger by `rm -rf`-ing and recreating a bridge
-	directory without stopping its bridge first.
+    knows about the PID recorded in `.sbcl-bridge.pid` for *its*
+    `SBCL_BRIDGE_DIR`; a leftover process pointed at the same directory from
+    an earlier, differently-invoked session can race with a newly started
+    one. The telltale symptom: requests are claimed and archived normally but
+    *some* responses never appear in `sbcl-output.log` (roughly alternating,
+    since the two loops take turns winning the claim) — the losing bridge is
+    writing its responses to whatever its own stdout points at, which, if the
+    directory was deleted and recreated under it, is a deleted inode. This is
+    especially easy to trigger by `rm -rf`-ing and recreating a bridge
+    directory without stopping its bridge first.
 
 - **Logs growing without bound**
   - Nothing has called `status` or `rotate-logs` recently — see §9's last
-	point.
+    point.
 
 - **A request seems to hang forever with no timeout firing**
   - Check whether it was submitted with `SBCL_REQUEST_TIMEOUT=none`; use
-	`ctl.sh interrupt` to cancel it directly.
+    `ctl.sh interrupt` to cancel it directly.
 
 ---
 
