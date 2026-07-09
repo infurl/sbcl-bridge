@@ -1002,7 +1002,7 @@ invocation style.
   moves — the directory the bridge watches is baked in too, as
   `*bridge-directory*`, precisely so a resume needs no arguments. In the same
   shared-workspace workflow as above (a host and a container mounting the same
-  directory at *different* paths — `/home/andrew/workspace` on the host,
+  directory at *different* paths — `/home/user/workspace` on the host,
   `/workspace` in the container, say), a core suspended on one side and
   resumed on the other would, without correction, come back healthy, running,
   and watching a directory that doesn't exist (or exists but is the wrong one)
