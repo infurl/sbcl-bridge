@@ -577,6 +577,289 @@ request-cancelled condition."
       (sleep poll-interval))))
 
 ;;; ---------------------------------------------------------------------
+;;; Quicklisp integration
+;;;
+;;; If QUICKLISP_HOME is set in the environment, the bridge makes a
+;;; best-effort attempt to have a working Quicklisp available at that
+;;; location, and pointed there, every time run-bridge starts --
+;;; whether that's a genuine first start or a resume. Three cases:
+;;;
+;;;   1. Nothing at QUICKLISP_HOME yet -> install fresh (see
+;;;      LOCATE-QUICKLISP-INSTALLER / INSTALL-QUICKLISP-IF-NEEDED for
+;;;      where the installer script itself comes from).
+;;;   2. Quicklisp not yet loaded in THIS image, but already installed
+;;;      at QUICKLISP_HOME (by a previous process, or by step 1 just
+;;;      now) -> just (load ".../setup.lisp"), an ordinary first
+;;;      bootstrap.
+;;;   3. Quicklisp already loaded in this image (a resume where it was
+;;;      loaded before suspend) -> if QUICKLISP_HOME now names a
+;;;      DIFFERENT directory than what's baked in, redirect the
+;;;      already-loaded client there (SYNC-QUICKLISP-HOME) rather than
+;;;      trying to reload anything.
+;;;
+;;; This exists for the same reason the SBCL_BRIDGE_DIR/SBCL_HOME
+;;; overrides do: in a shared-workspace-across-environments setup (a
+;;; host and a container, say), QUICKLISP_HOME can legitimately be a
+;;; different absolute path in each environment even when it's
+;;; logically "the same" Quicklisp installation (or two independent
+;;; ones the operator wants used in each place respectively) -- and,
+;;; verified directly against the Quicklisp client source rather than
+;;; assumed, simply SETF-ing ql:*quicklisp-home* is not sufficient to
+;;; redirect an already-loaded client (see SYNC-QUICKLISP-HOME).
+;;;
+;;; Every entry point here is best-effort and defensive: none of this
+;;; is allowed to prevent the bridge from starting. A failure at any
+;;; step is logged and the bridge proceeds without a working Quicklisp
+;;; for that session, available to try again on the next resume.
+;;;
+;;; A note on style: essentially everything Quicklisp-related below is
+;;; accessed indirectly through QL-SYMBOL/QL-VALUE/QL-CALL rather than
+;;; as ordinary package-qualified symbols like QL:QUICKLOAD. This is
+;;; not a stylistic preference -- writing a literal reference to a
+;;; symbol in a package that doesn't exist yet (ql, ql-setup,
+;;; ql-dist, quicklisp-quickstart -- none of which exist on a system
+;;; that has never loaded Quicklisp) is a READER error in Common Lisp,
+;;; not a runtime error: it would prevent this FILE from loading at
+;;; all, for every user, including those who never set QUICKLISP_HOME.
+;;; Resolving everything through FIND-PACKAGE/FIND-SYMBOL on strings
+;;; defers that resolution to runtime, after the relevant package is
+;;; known to exist.
+
+(defparameter *quicklisp-installer-url* "https://beta.quicklisp.org/quicklisp.lisp"
+  "Default URL to download a quicklisp.lisp bootstrap installer from,
+as a last resort, if one can't be found locally. Overridable per-run
+via the QUICKLISP_INSTALLER_URL environment variable (see
+EFFECTIVE-QUICKLISP-INSTALLER-URL) -- useful for pointing at an
+internal mirror when the real one isn't reachable, and also what
+makes it possible to test the \"nothing worked\" path deterministically
+regardless of whether this machine's curl/wget can actually reach the
+real internet (see sbcl-bridge-test.sh).")
+
+(defun effective-quicklisp-installer-url ()
+  "QUICKLISP_INSTALLER_URL from the environment if set and non-empty,
+else *quicklisp-installer-url*."
+  (let ((env (sb-ext:posix-getenv "QUICKLISP_INSTALLER_URL")))
+    (if (and env (plusp (length env))) env *quicklisp-installer-url*)))
+
+(defun ql-symbol (package-name symbol-name)
+  "Find SYMBOL-NAME (a string) in PACKAGE-NAME (a string), or NIL if
+either the package or the symbol doesn't exist. See the note at the
+top of this section on why this indirection matters."
+  (let ((package (find-package package-name)))
+    (and package (find-symbol symbol-name package))))
+
+(defun ql-value (package-name symbol-name)
+  "SYMBOL-VALUE of PACKAGE-NAME:SYMBOL-NAME (both strings), or NIL if
+the package, symbol, or binding doesn't exist."
+  (let ((sym (ql-symbol package-name symbol-name)))
+    (and sym (boundp sym) (symbol-value sym))))
+
+(defun (setf ql-value) (new-value package-name symbol-name)
+  "Set PACKAGE-NAME:SYMBOL-NAME (both strings) to NEW-VALUE. Errors if
+the package or symbol doesn't exist -- unlike QL-VALUE's read side,
+there's no sensible NIL fallback for a set that silently didn't
+happen, so callers should confirm the target is expected to exist
+(e.g. by checking FIND-PACKAGE first) before setting through this."
+  (let ((sym (ql-symbol package-name symbol-name)))
+    (unless sym (error "~a:~a not found" package-name symbol-name))
+    (setf (symbol-value sym) new-value)))
+
+(defun ql-call (package-name symbol-name &rest args)
+  "Like (funcall (find-symbol ...) ...), resolved from strings. Errors
+if the package or symbol doesn't exist."
+  (let ((sym (ql-symbol package-name symbol-name)))
+    (unless sym (error "~a:~a not found" package-name symbol-name))
+    (apply sym args)))
+
+(defun run-and-check (program args output-file)
+  "Best-effort: run PROGRAM with ARGS via SB-EXT:RUN-PROGRAM (searching
+PATH), discarding its own stdout/stderr, and report success only if it
+exited zero AND OUTPUT-FILE exists and is non-empty afterward. Never
+signals -- a missing PROGRAM, a network failure, or anything else
+simply results in NIL, exactly like a failed download should."
+  (ignore-errors
+    (let ((process (sb-ext:run-program program args
+                                        :search t
+                                        :output nil
+                                        :error nil
+                                        :input nil
+                                        :wait t)))
+      (and process
+           (eql (sb-ext:process-exit-code process) 0)
+           (probe-file output-file)
+           (plusp (with-open-file (s output-file :element-type '(unsigned-byte 8))
+                    (file-length s)))))))
+
+(defun download-file (url target-path)
+  "Best-effort download of URL to TARGET-PATH using curl or wget,
+whichever is found first on PATH. Downloads to a temp file and renames
+into place atomically, so a failed or interrupted download never
+leaves a partial file sitting at TARGET-PATH. Returns T on success,
+NIL otherwise -- never signals. Deliberately shells out rather than
+speaking HTTP/TLS directly: writing (and trusting) a TLS client is a
+lot of surface area for what curl/wget already do robustly, and
+that's almost always available on a system that also has SBCL."
+  (ignore-errors
+    (ensure-directories-exist target-path)
+    (let ((tmp (make-pathname
+                :name (concatenate 'string (pathname-name target-path) "-download-tmp")
+                :defaults target-path)))
+      (ignore-errors (delete-file tmp))
+      (when (or (run-and-check "curl" (list "-fsSL" "--max-time" "30" "-o" (namestring tmp) url) tmp)
+                (run-and-check "wget" (list "-q" "--timeout=30" "-O" (namestring tmp) url) tmp))
+        (rename-file tmp target-path)
+        t))))
+
+(defun locate-quicklisp-installer (bridge-dir)
+  "Best-effort search for a usable quicklisp.lisp bootstrap installer,
+trying, in order:
+  1. QUICKLISP_LISP -- an environment variable naming its exact path,
+     for callers who already have a copy somewhere of their choosing;
+  2. /usr/share/common-lisp/source/quicklisp/quicklisp.lisp -- where
+     it lands on Debian/Ubuntu if installed via a system package;
+  3. a copy already downloaded by a previous run of this function,
+     cached in BRIDGE-DIR, so a working installer is only ever
+     downloaded once even across many restarts;
+  4. downloading a fresh copy from EFFECTIVE-QUICKLISP-INSTALLER-URL
+     into that same cache location.
+Returns a pathname, or NIL if every option failed."
+  (let ((cached (merge-pathnames "quicklisp-installer.lisp" bridge-dir))
+        (env-path (sb-ext:posix-getenv "QUICKLISP_LISP"))
+        (url (effective-quicklisp-installer-url)))
+    (or (and env-path (plusp (length env-path)) (probe-file env-path))
+        (probe-file "/usr/share/common-lisp/source/quicklisp/quicklisp.lisp")
+        (probe-file cached)
+        (progn
+          (with-output-lock
+            (format t "~&;;; QUICKLISP: no local quicklisp.lisp found (checked QUICKLISP_LISP and ~
+the usual Debian/Ubuntu path); attempting to download from ~a~%"
+                    url)
+            (finish-output))
+          (and (download-file url cached)
+               (probe-file cached))))))
+
+(defun install-quicklisp-if-needed (target-home bridge-dir)
+  "Best-effort fresh Quicklisp install at TARGET-HOME. Never signals;
+on any failure, logs why and returns NIL, leaving TARGET-HOME without
+a working Quicklisp for this session (a later resume/restart gets
+another chance). Returns T on apparent success."
+  (with-output-lock
+    (format t "~&;;; QUICKLISP: no installation found at ~a; installing~%" target-home)
+    (finish-output))
+  (handler-case
+      (let ((installer (locate-quicklisp-installer bridge-dir)))
+        (unless installer
+          (with-output-lock
+            (format t "~&;;; QUICKLISP: could not find or download a quicklisp.lisp installer; ~
+continuing without Quicklisp this session~%")
+            (finish-output))
+          (return-from install-quicklisp-if-needed nil))
+        (load installer)
+        (let ((install-fn (ql-symbol "QUICKLISP-QUICKSTART" "INSTALL")))
+          (unless (and install-fn (fboundp install-fn))
+            (with-output-lock
+              (format t "~&;;; QUICKLISP: ~a loaded but did not define ~
+QUICKLISP-QUICKSTART:INSTALL as expected; giving up~%" installer)
+              (finish-output))
+            (return-from install-quicklisp-if-needed nil))
+          (funcall install-fn :path target-home))
+        (with-output-lock
+          (format t "~&;;; QUICKLISP: installed at ~a~%" target-home)
+          (finish-output))
+        t)
+    (error (c)
+      (with-output-lock
+        (format t "~&;;; QUICKLISP: install failed: ~a; continuing without Quicklisp this session~%" c)
+        (finish-output))
+      nil)))
+
+(defun paths-equal-p (a b)
+  "T if A and B name the same existing filesystem location (compared
+via TRUENAME, so equivalent-but-differently-spelled paths -- relative
+vs. absolute, symlinks, trailing-slash differences -- compare equal);
+NIL if either fails to resolve (e.g. doesn't exist, which is expected
+whenever a suspended image's baked-in path doesn't exist in the
+resuming environment) or if they genuinely differ."
+  (let ((ta (ignore-errors (truename a)))
+        (tb (ignore-errors (truename b))))
+    (and ta tb (equal ta tb))))
+
+(defun sync-quicklisp-home (target-home)
+  "Point an already-loaded Quicklisp client at TARGET-HOME instead of
+wherever ql:*quicklisp-home* currently points -- for the same reason
+RESUME-BRIDGE overrides *bridge-directory* from SBCL_BRIDGE_DIR: an
+absolute path baked into a suspended image can go stale when the
+image moves to a different environment.
+
+Setting ql-setup:*quicklisp-home* alone is NOT enough for this to
+actually work, which was verified directly against the real Quicklisp
+client source rather than assumed: ql:*local-project-directories* is a
+DEFPARAMETER computed once, at load time, via (qmerge \"local-projects/\"),
+not recomputed on every access -- so it silently keeps pointing at the
+OLD home forever unless reset by hand here. Dist objects themselves
+need no equivalent fix and are NOT handled here: ql-dist:all-dists
+rebuilds its dist objects from scratch, via qmerge again, on every
+single call (see standard-dist-enumeration-function in Quicklisp's own
+dist.lisp) rather than caching them in a global -- so plain quickloads
+of dist-hosted systems already follow *quicklisp-home* correctly with
+no help needed."
+  (setf (ql-value "QL-SETUP" "*QUICKLISP-HOME*") target-home)
+  (setf (ql-value "QL" "*LOCAL-PROJECT-DIRECTORIES*")
+        (list (ql-call "QL-SETUP" "QMERGE" "local-projects/")))
+  ;; Re-running QL:SETUP is cheap and has two genuinely useful side
+  ;; effects beyond what's fixed above: it creates local-projects/ at
+  ;; the new home if missing, and re-runs any local-init/*.lisp files
+  ;; found there -- relevant if the two environments have different
+  ;; local customizations.
+  (ql-call "QL" "SETUP"))
+
+(defun ensure-quicklisp-configured (bridge-dir)
+  "If QUICKLISP_HOME is set in the environment, make a best-effort
+attempt to have a working Quicklisp available there and pointed there,
+covering all three cases documented at the top of this section.
+Called from RUN-BRIDGE on every start, fresh or resumed. Does nothing
+at all if QUICKLISP_HOME is unset or empty -- this entire feature is
+opt-in, purely by that variable's presence."
+  (let ((env-home (sb-ext:posix-getenv "QUICKLISP_HOME")))
+    (unless (and env-home (plusp (length env-home)))
+      (return-from ensure-quicklisp-configured))
+    (let* ((target-home (ensure-directory-pathname env-home))
+           (setup-lisp-path (merge-pathnames "setup.lisp" target-home)))
+      (unless (probe-file setup-lisp-path)
+        (install-quicklisp-if-needed target-home bridge-dir))
+      (unless (probe-file setup-lisp-path)
+        (with-output-lock
+          (format t "~&;;; QUICKLISP: still not available at ~a after an install attempt; ~
+continuing without it this session~%" target-home)
+          (finish-output))
+        (return-from ensure-quicklisp-configured))
+      (if (find-package "QL-SETUP")
+          ;; Client already resident in this image -- either loaded
+          ;; moments ago by install-quicklisp-if-needed as a side
+          ;; effect of installing, or (the resume case) already loaded
+          ;; before this image was suspended. Either way, just make
+          ;; sure it's pointed at the right place; never reload it.
+          (let ((current-home (ql-value "QL-SETUP" "*QUICKLISP-HOME*")))
+            (unless (paths-equal-p current-home target-home)
+              (with-output-lock
+                (format t "~&;;; QUICKLISP: QUICKLISP_HOME changed: ~a -> ~a~%"
+                        current-home target-home)
+                (finish-output))
+              (sync-quicklisp-home target-home)))
+          ;; First time Quicklisp is being loaded in this image at all.
+          (handler-case
+              (progn
+                (load setup-lisp-path)
+                (with-output-lock
+                  (format t "~&;;; QUICKLISP: loaded, home=~a~%" target-home)
+                  (finish-output)))
+            (error (c)
+              (with-output-lock
+                (format t "~&;;; QUICKLISP: loading ~a failed: ~a; continuing without ~
+Quicklisp this session~%" setup-lisp-path c)
+                (finish-output))))))))
+
+;;; ---------------------------------------------------------------------
 ;;; Main loop
 
 (defun run-bridge (&key (directory (error "DIRECTORY is required"))
@@ -634,6 +917,15 @@ Does not return under normal operation."
       (format t "~&;;; SBCL-BRIDGE STARTED dir=~a ts=~a default-timeout=~a~%"
               dir (get-universal-time) (or default-timeout "none"))
       (finish-output))
+    ;; Best-effort, opt-in (via QUICKLISP_HOME) Quicklisp setup -- see
+    ;; the "Quicklisp integration" section above. The function itself
+    ;; is already internally defensive (every step has its own
+    ;; handler-case/ignore-errors and logs rather than signals), but
+    ;; this outer IGNORE-ERRORS is a deliberate second layer: nothing
+    ;; in this feature, including a bug in it, may ever prevent the
+    ;; bridge from reaching its main loop and becoming usable for
+    ;; ordinary (non-Quicklisp) requests.
+    (ignore-errors (ensure-quicklisp-configured dir))
     (loop
       (block iteration
         (handler-bind

@@ -18,8 +18,11 @@ the system. It covers four files:
 
 - `sbcl-bridge-test.sh`
   - End-to-end smoke test: spins up a throwaway bridge in a temp directory and
-	exercises every major behavior in ~30 seconds. Run it after any SBCL
-	upgrade or change to the bridge itself.
+	exercises every major behavior in ~60 seconds. Run it after any SBCL
+	upgrade or change to the bridge itself. Every run — pass or fail — leaves
+	a `sbcl-bridge-test-diagnostics-<timestamp>.tar.gz` in the directory it
+	was invoked from (see §3.1); handing that file over is usually enough to
+	debug a failure on a machine nobody else can log into.
 
 > **Provenance and AI Disclosure**
 >
@@ -112,6 +115,7 @@ bridge-dir/
 ├── cores/                        # suspended executable images and metadata
 │   ├── bridge-<timestamp>.core
 │   └── bridge-<timestamp>.core.version
+├── quicklisp-installer.lisp      # cached quicklisp.lisp download
 └── logs/                         # rotated, gzipped log generations
     ├── sbcl-output.log.<timestamp>.gz
     └── sbcl-input.log.<timestamp>.gz
@@ -184,12 +188,12 @@ Every request produces a block in `sbcl-output.log` that looks like this:
 ;;; END-OUTPUT id=my-unique-id status=ok
 ```
 
-- One `;;; => value1 ; value2 ; ...` line is printed per evaluated form, using
-  `~S` (so it round-trips as Lisp), with multiple return values separated by
-  `;`. A value whose *printing* signals (a broken `print-object` method, say)
-  is rendered as `#<unprintable TYPE>` instead — the form evaluated
-  successfully, so a presentation failure doesn't flip the request to
-  `status=error`. (Printing that *loops* rather than signals — circular
+- One `;;; => value1 ; value2 ; ...` line is printed per evaluated form,
+  using `~S` (so it round-trips as Lisp), with multiple return values
+  separated by `;`. A value whose *printing* signals (a broken `print-object`
+  method, say) is rendered as `#<unprintable TYPE>` instead — the form
+  evaluated successfully, so a presentation failure doesn't flip the request
+  to `status=error`. (Printing that *loops* rather than signals — circular
   structure, since `*print-circle*` is off for round-trippable output — is
   bounded by the request timeout instead.)
 
@@ -280,14 +284,56 @@ chmod +x sbcl-bridge-ctl.sh sbcl-client.sh sbcl-bridge-test.sh
 ```
 
 To verify the installation (and re-verify after any SBCL upgrade), run the
-smoke test — it needs no setup, uses a temp directory, and cleans up after
-itself:
+smoke test — it needs no setup and uses throwaway temp directories for the
+bridges it starts:
 
 ```bash
 ./sbcl-bridge-test.sh
 # ...
-# == 32 passed, 0 failed ==
+# == 35 passed, 0 failed ==
+#
+# Diagnostics bundle: /path/you/ran/this/from/sbcl-bridge-test-diagnostics-20260101-120000.tar.gz
 ```
+
+### 3.1 Diagnostics bundle
+
+Every run of `sbcl-bridge-test.sh` — whether everything passes or something
+fails — ends by writing a single `sbcl-bridge-test-diagnostics-<timestamp>.tar.gz`
+to the directory it was invoked from. This is deliberately the one thing the
+otherwise-thorough cleanup *doesn't* touch: every throwaway bridge directory
+the run creates gets deleted as usual, but not before its logs are copied
+into this bundle first, so the evidence survives the cleanup instead of being
+deleted along with the temp directories it lived in.
+
+The bundle contains:
+
+- `transcript.log` — everything the script printed, exactly as seen on the
+  terminal (stdout and stderr together), including internal
+  `wait_for_log_pattern` timing lines — useful because how long the bridge
+  takes to finish starting varies with machine speed and load in ways a single
+  number measured on one machine can't predict, which is exactly what made the
+  fixed-sleep version of this suite's own readiness checks flaky.
+
+- `summary.txt` — just the `PASS`/`FAIL` lines and the final tally, for a
+  quick look without reading the full transcript.
+
+- `environment.txt` — SBCL version, `uname -a`, core count and memory, every
+  `SBCL_*`/`QUICKLISP_*` environment variable this tooling reads (or
+  confirmation it's unset), `PATH`, and `curl`/`wget` availability and
+  versions. Nothing here is secret — paths and version strings, nothing that
+  looks like a credential.
+
+- `logs/<label>/` — the `sbcl-output.log`, `sbcl-input.log`, `processed/`
+  archive, and any `.version` sidecars from every bridge directory the run
+  touched (`main`, `preflight`, `quicklisp-unset`, `quicklisp-degrade`,
+  `moved-workspace`), captured just before that directory was deleted.  `main`
+  is the primary bridge used for most of the suite and usually the most
+  informative; the others correspond to the specific isolated scenarios named
+  in §8's feature sections.
+
+If a test fails (or behaves differently) on a machine you can't get direct
+access to, this bundle is normally enough to debug from — attach it rather
+than trying to describe what happened secondhand.
 
 ---
 
@@ -389,6 +435,17 @@ shell scripts are for), but it's useful to know what's in it.
   hooks is an implementation detail that has shifted across SBCL versions —
   setting both means the reqid-logging backstop runs regardless of which one a
   given SBCL consults first.
+
+- **Quicklisp support (§8.7) never references a Quicklisp symbol directly.**
+  `ql:quickload`, `ql-setup:*quicklisp-home*`, `quicklisp-quickstart:install`
+  and everything else Quicklisp-related is resolved at runtime via
+  `find-package`/`find-symbol` on plain strings. A literal package-qualified
+  symbol referencing a package that doesn't exist is a **reader** error in
+  Common Lisp — it would happen while `sbcl-bridge.lisp` itself is being
+  loaded, before any code runs, breaking the bridge for every user regardless
+  of whether they ever set `QUICKLISP_HOME`. String-based resolution defers
+  that lookup until the package is known to exist (or gracefully handles it
+  not existing at all).
 
 ---
 
@@ -582,25 +639,25 @@ Just Works — this is the idiomatic way to package a setup script that knows
 its own identity and how long it's allowed to take:
 
 ```lisp
-;;; REQID: quicklisp-loader
+;;; REQID: project-setup
 ;;; TIMEOUT: 45
 
 (in-package #:cl-user)
-(load #P"/usr/share/common-lisp/source/quicklisp/quicklisp.lisp")
-(ql:quickload "alexandria")
-;; ...
+(dolist (file '("package.lisp" "utils.lisp" "server.lisp"))
+  (load (merge-pathnames file #P"/workspace/myproject/src/")))
+(defparameter *server-ready* t)
 ```
 
 ```bash
-./sbcl-client.sh file quicklisp-loader.lisp
+./sbcl-client.sh file project-setup.lisp
 # ...
-# ;;; END-OUTPUT id=quicklisp-loader status=ok
+# ;;; END-OUTPUT id=project-setup status=ok
 ```
 
-The response markers and the `processed/` archive carry `quicklisp-loader`,
-and the client waits up to 50 seconds (45 + 5) rather than abandoning the
-request at its default 30 — previously the bridge would honor the embedded
-`TIMEOUT` while the client, unaware of it, gave up first with exit 2.
+The response markers and the `processed/` archive carry `project-setup`, and
+the client waits up to 50 seconds (45 + 5) rather than abandoning the request
+at its default 30 — previously the bridge would honor the embedded `TIMEOUT`
+while the client, unaware of it, gave up first with exit 2.
 
 Precedence for the evaluation timeout, highest first: `SBCL_REQUEST_TIMEOUT`
 (env) → embedded `;;; TIMEOUT:` header → the bridge's default. (The env value
@@ -945,7 +1002,7 @@ invocation style.
   moves — the directory the bridge watches is baked in too, as
   `*bridge-directory*`, precisely so a resume needs no arguments. In the same
   shared-workspace workflow as above (a host and a container mounting the same
-  directory at *different* paths — `/home/user/workspace` on the host,
+  directory at *different* paths — `/home/andrew/workspace` on the host,
   `/workspace` in the container, say), a core suspended on one side and
   resumed on the other would, without correction, come back healthy, running,
   and watching a directory that doesn't exist (or exists but is the wrong one)
@@ -998,17 +1055,16 @@ invocation style.
   fix, because it lives entirely in what *your own* setup code does: Quicklisp
   and ASDF bake absolute paths into their own caches too (`dist` directories,
   `ql:*quicklisp-home*`, compiled fasl locations under `XDG_CACHE_HOME`,
-  ASDF's source-registry). If a `quicklisp-loader.lisp` like the one in this
-  repo's examples is run once, baked into a suspended image, and then the
-  image is resumed somewhere those paths don't resolve the same way, you can
-  hit an analogous class of failure — just one this tooling has no visibility
-  into. The practical mitigation is the mirror image of the advice above:
-  either make sure `QUICKLISP_HOME` and `XDG_CACHE_HOME` (or wherever your
-  setup script points) resolve to *identical* absolute paths in every
-  environment that will resume the image — unlike the bridge's own workspace,
-  which is expected to differ — or re-run the setup script fresh after
-  resuming in a new environment rather than relying on state baked in before
-  the move.
+  ASDF's source-registry). If a setup script is run once, baked into a
+  suspended image, and then the image is resumed somewhere those paths don't
+  resolve the same way, you can hit an analogous class of failure — just one
+  this tooling has no visibility into. The practical mitigation is the mirror
+  image of the advice above: either make sure `QUICKLISP_HOME` and
+  `XDG_CACHE_HOME` (or wherever your setup script points) resolve to
+  *identical* absolute paths in every environment that will resume the image —
+  unlike the bridge's own workspace, which is expected to differ — or re-run
+  the setup script fresh after resuming in a new environment rather than
+  relying on state baked in before the move.
 
   One thing that turned out **not** to need any fix, verified directly rather
   than assumed: `*default-pathname-defaults*`, which governs how relative
@@ -1120,6 +1176,133 @@ RSS exceeds that threshold — enough to notice a slow memory leak over a
 long-running agent session before it becomes an out-of-memory problem for the
 container.
 
+### 8.7 Quicklisp integration
+
+If `QUICKLISP_HOME` is set in the environment, the bridge makes a best-effort
+attempt, on every `run-bridge` start — a fresh `start` or a `resume`, either
+one — to have a working Quicklisp available there and pointed there. With
+`QUICKLISP_HOME` unset, none of this runs; the feature is entirely opt-in by
+that variable's presence.
+
+```bash
+export QUICKLISP_HOME=/workspace/quicklisp
+./sbcl-bridge-ctl.sh start
+# sbcl-output.log:
+# ;;; QUICKLISP: loaded, home=/workspace/quicklisp/
+```
+
+**Why this exists.** Quicklisp turned out to have exactly the same moved-image
+problem as `SBCL_HOME` and the bridge's own watched directory (§8.4) — a
+shared workspace mounted at different paths in different environments means
+`QUICKLISP_HOME` can legitimately differ between a suspend and a resume — but
+with a sharper edge: getting it wrong doesn't fail loudly, it fails by
+`ql:quickload` quietly reading from (or writing to) the wrong directory. A
+hand-rolled setup script has to get this right on its own; building it into
+the bridge means every request-time script can just assume Quicklisp is
+already correctly configured for whatever `QUICKLISP_HOME` says right now.
+
+**Three cases, all handled by the same `ensure-quicklisp-configured` call:**
+
+1. **Nothing installed at `QUICKLISP_HOME` yet.** The bridge attempts a fresh
+   install, locating a `quicklisp.lisp` bootstrap installer by checking, in
+   order: `QUICKLISP_LISP` (an environment variable naming its exact path);
+   `/usr/share/common-lisp/source/quicklisp/quicklisp.lisp` (where
+   Debian/Ubuntu's package puts it, if installed that way); a copy already
+   cached from a previous run at `<bridge-directory>/quicklisp-installer.lisp`
+   (see §2.4); and, only if all of those come up empty, a fresh download — via
+   `curl` or `wget` (whichever is found first on `PATH`) — into that same
+   cache location, from `https://beta.quicklisp.org/quicklisp.lisp` by
+   default, or `QUICKLISP_INSTALLER_URL` if that environment variable is set
+   (useful for pointing at an internal mirror when the real one isn't
+   reachable). Downloaded to a temp file and renamed into place atomically, so
+   an interrupted download never leaves a broken file to be mistaken for a
+   good one on the next attempt. Once an installer is loaded,
+   `quicklisp-quickstart:install :path QUICKLISP_HOME` does the rest.
+
+2. **Already installed at `QUICKLISP_HOME`, but not yet loaded in this
+   image.** An ordinary `(load ".../setup.lisp")` — the same thing a
+   hand-rolled setup request would otherwise have to do itself.
+
+3. **Already loaded in this image (a resume where Quicklisp was loaded before
+   suspend).** If `QUICKLISP_HOME` now names a *different* directory than
+   what's baked into the image, the already-loaded client is redirected there
+   rather than reloaded — see "The sync, and why it's not just one `setf`"
+   below.
+
+Every step is best-effort and defensive by design, matching the philosophy
+already established for `SBCL_HOME` restoration: nothing here is allowed to
+prevent the bridge from starting or reaching its main loop. A failure at any
+point — no installer locatable, a network failure partway through an install,
+a `(load ...)` error — is logged to `sbcl-output.log` with a `;;; QUICKLISP:
+...` line explaining what happened, and the bridge continues normally, usable
+for any request that doesn't need Quicklisp. The very next resume or restart
+gets another chance.
+
+**The sync, and why it's not just one `setf`.** Redirecting an already-loaded
+Quicklisp client to a new `QUICKLISP_HOME` is not simply `(setf
+ql:*quicklisp-home* new-path)`, and this was verified directly against the
+actual Quicklisp client source rather than assumed. Two things turned out to
+matter:
+
+- `ql:*local-project-directories*` is a Quicklisp-internal `defparameter`,
+  computed *once*, at load time, via `(qmerge "local-projects/")` — not
+  recomputed on every access. Left alone, it keeps pointing at the old
+  `local-projects/` forever, silently, no matter what `*quicklisp-home*` is
+  set to afterward. The bridge resets it explicitly alongside the home
+  directory itself.
+
+- Dist objects, reassuringly, need **no** equivalent fix.  `ql-dist:all-dists`
+  doesn't cache a persistent list anywhere — it rebuilds dist objects from
+  scratch, via `qmerge` again, on *every single call*
+  (`standard-dist-enumeration-function` just re-scans `(qmerge
+  "dists/*/distinfo.txt")` each time it's invoked). So a plain `ql:quickload`
+  of anything not already loaded correctly follows an updated
+  `*quicklisp-home*` on its own, with no help needed — verified by building
+  two independent fake dists in two separate fake `QUICKLISP_HOME` trees and
+  confirming `ql-dist:all-dists` switched from one to the other immediately
+  after changing `*quicklisp-home*`, with zero other calls in between.
+
+  The sync also re-runs `ql:setup`, which is cheap and has two genuinely
+  useful side effects beyond the two points above: it creates
+  `local-projects/` at the new home if it doesn't already exist there, and
+  re-runs any `local-init/*.lisp` files found there — relevant if the two
+  environments have different local Quicklisp customizations.
+
+**A note on hand-rolled setup requests.** With this feature in place, a setup
+request that used to bootstrap Quicklisp itself — typically an `#-quicklisp
+(load ".../setup.lisp")` block guarding a one-time load — no longer needs that
+block at all: by the time any request runs, Quicklisp is already loaded and
+pointed at the right place if `QUICKLISP_HOME` is set.  Such a request can be
+simplified to just the `ql:quickload` calls for whatever systems it
+needs. Existing scripts that still carry the old bootstrap block keep working
+exactly as before — the `#-quicklisp` guard on that block means it simply
+never runs once Quicklisp is already loaded, which after this feature, it
+always will be.
+
+**A note on reader safety, for anyone reading `sbcl-bridge.lisp` itself.**
+Every Quicklisp-related symbol the bridge touches (`ql:quickload`,
+`ql-setup:*quicklisp-home*`, `quicklisp-quickstart:install`, and so on) is
+resolved indirectly through `find-package`/`find-symbol` on plain strings,
+never written as an ordinary package-qualified symbol like `ql:setup` in the
+source text. This is not a style preference: in Common Lisp, a literal
+reference to a symbol in a package that doesn't exist is a **reader** error,
+not a runtime one — it happens while the file is merely being read, before any
+code from it has run. Writing `ql:setup` directly into `sbcl-bridge.lisp`'s
+source would make the entire file fail to load on any system where Quicklisp
+isn't already present — breaking the bridge for every user, including everyone
+who never sets `QUICKLISP_HOME` — rather than failing gracefully only for the
+one feature that actually needs it.
+
+**What this doesn't cover.** Compiled fasl caches under `XDG_CACHE_HOME`, and
+anything a setup script itself bakes in as an absolute path (e.g. a
+project-specific `local-projects/` symlink target), are outside what this
+feature manages — see §8.4's note on this same category of risk for
+`SBCL_HOME`. The practical mitigation is the same: keep `XDG_CACHE_HOME`
+resolving to an identical absolute path in every environment that will resume
+the image, since — unlike `QUICKLISP_HOME` and the bridge's own workspace,
+which are expected to differ — there's no equivalent built-in correction for
+it.
+
 ---
 
 ## 9. Known limitations & caveats
@@ -1205,6 +1388,54 @@ Worth internalizing before you rely on this in production:
   to recycle the PID would still pass. If you resume from a custom core path,
   keep the `.core` suffix so the check recognizes it; on systems without
   `/proc`, the check degrades to a bare `kill -0`.
+
+- **A fresh Quicklisp install needs real network access to
+  `beta.quicklisp.org`** (§8.7). This is only reached as a last resort — if
+  `QUICKLISP_LISP`, the Debian/Ubuntu path, or a previously cached download
+  already provide a `quicklisp.lisp` installer, no network call happens at all
+  — but in a network-restricted container, none of those may apply on the very
+  first run. If outbound access to `beta.quicklisp.org` isn't available,
+  pre-fetch `quicklisp.lisp` some other way and either point `QUICKLISP_LISP`
+  at it or place it at the Debian/Ubuntu path, set `QUICKLISP_INSTALLER_URL`
+  to an internal mirror, or install Quicklisp into `QUICKLISP_HOME` by some
+  other means entirely before ever starting the bridge — case 2 in §8.7
+  (already installed, just needs loading) doesn't touch the network at all.
+
+- **`SB-EXT:RUN-PROGRAM`'s PATH search silently falls through to the next
+  candidate if the first one it finds exists but can't actually be executed**
+  — a read-only or `noexec`-mounted temp directory is enough to trigger this.
+  This isn't specific to Quicklisp support, but it's where it was actually
+  found: an early version of `sbcl-bridge-test.sh` tried to force a download
+  failure by putting always-failing stand-in `curl`/`wget` scripts earlier on
+  `PATH`, which worked on some machines and silently didn't on others — the
+  fake binary was found but skipped as unexecutable, and the real `curl`
+  further down `PATH` ran instead, quietly succeeding at a real install. This
+  is a real, general gotcha worth knowing if you're ever tempted to shadow a
+  binary on `PATH` for similar reasons elsewhere.
+
+  The fix that followed — pointing `QUICKLISP_INSTALLER_URL` at an unreachable
+  local address instead of hiding the tools — turned out to be necessary but
+  not sufficient, which is worth knowing on its own: that variable only
+  controls step 4 of the installer search (§8.7) — downloading the bootstrap
+  *script*. It has no effect if steps 1–3 already supply one, and a machine
+  with Quicklisp's Debian/Ubuntu package installed at the usual system path
+  does exactly that, bypassing the override entirely. Worse, even when the
+  override *does* apply, it only blocks fetching the script — once any
+  installer is in hand, from any source, calling `quicklisp-quickstart:install`
+  does its own separate round of network I/O against URLs hardcoded inside
+  that script, which nothing here has a hook into. There is no portable,
+  machine-independent way to force Quicklisp installation to fail from outside
+  it. The smoke test's Quicklisp checks reflect this: rather than asserting
+  one specific outcome, they accept either a successful install or a graceful
+  failure as correct, and assert the one thing that's actually guaranteed
+  either way — the bridge stays usable. A genuine, successful install on a
+  machine that has a real path to one isn't a bug to work around; it's this
+  feature working as intended.
+
+- **Quicklisp's own compiled-fasl and local-project caches are outside this
+  feature's scope** (§8.7's closing note) — the same category of risk as
+  `SBCL_HOME`, but for `XDG_CACHE_HOME` and anything a setup script bakes in
+  as an absolute path, with no equivalent built-in correction.
 
 ---
 
@@ -1293,6 +1524,20 @@ Worth internalizing before you rely on this in production:
 	`sbcl-bridge-ctl.sh`/`sbcl-bridge.lisp` predating this override existing
 	at all.
 
+- **`(require "UIOP")` (or `ql:quickload`) fails inside a request even though
+  `QUICKLISP_HOME` is set correctly**
+  - Check `sbcl-output.log` for a `;;; QUICKLISP: ...` line from the most
+	recent start or resume (§8.7) — it explains exactly what happened:
+	`loaded, home=...` means Quicklisp is ready and this is a different
+	problem; `install failed: ...` or `could not find or download a
+	quicklisp.lisp installer` means no network reached `beta.quicklisp.org`
+	and none of `QUICKLISP_LISP`, the Debian/Ubuntu path, or a cached download
+	provided one either — see the network-access limitation in §9.  If you
+	don't see any `;;; QUICKLISP:` line at all, `QUICKLISP_HOME` wasn't
+	actually set in the environment the bridge process itself was started with
+	(double-check it's exported, and exported *before* `ctl.sh
+	start`/`resume`, not just before submitting the request).
+
 - **A stray `sbcl` process left over from a previous test**
   - `ps aux | grep sbcl-bridge.lisp`, then `kill` it — `ctl.sh stop` only
 	knows about the PID recorded in `.sbcl-bridge.pid` for *its*
@@ -1322,6 +1567,7 @@ Worth internalizing before you rely on this in production:
 # Setup (once per shell)
 export SBCL_BRIDGE_DIR=/path/to/bridge
 export SBCL_BRIDGE_LISP=/path/to/sbcl-bridge.lisp
+export QUICKLISP_HOME=/path/to/quicklisp   # optional; see §8.7
 
 # Lifecycle
 ./sbcl-bridge-ctl.sh start

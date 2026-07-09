@@ -18,7 +18,18 @@
 #   SBCL_BRIDGE_LISP  bridge source (default: alongside this script)
 #
 # Takes roughly 20-30 seconds. Cleans up after itself (stops the
-# bridge, removes the temp directory) even on failure or ^C.
+# bridge, removes the temp directories it works in) even on failure or
+# ^C -- EXCEPT for one deliberate exception: every run leaves behind a
+# diagnostics bundle, a single .tar.gz written to the directory this
+# script was invoked FROM (never /tmp, which is exactly what gets
+# cleaned up), containing a full transcript of the run, environment
+# and version details, and every bridge log this run produced --
+# including from the throwaway directories that would otherwise be
+# deleted before anyone gets a chance to look at them. This is what
+# makes it practical to debug a failure on a machine nobody else can
+# log into: run the script, then send the one tarball it prints the
+# path to at the end. This happens on success too, not just failure --
+# useful for comparing a working run against a failing one.
 
 set -u
 
@@ -29,6 +40,112 @@ CLIENT="$SCRIPT_DIR/sbcl-client.sh"
 export SBCL_BRIDGE_DIR
 SBCL_BRIDGE_DIR="$(mktemp -d)"
 export SBCL_BRIDGE_LISP="${SBCL_BRIDGE_LISP:-$SCRIPT_DIR/sbcl-bridge.lisp}"
+
+# --- Diagnostics bundle -------------------------------------------
+#
+# Staged in a temp directory like everything else, but PACKAGED into
+# the directory this script was invoked from (captured as $(pwd) here,
+# before anything below has a chance to cd elsewhere) -- that's the
+# one directory in this whole script that's guaranteed to still exist,
+# and still be the one the person running this expects to look in,
+# after every throwaway bridge directory has been cleaned up.
+DIAG_INVOKED_FROM="$(pwd)"
+DIAG_DIR="$(mktemp -d)"
+mkdir -p "$DIAG_DIR/logs"
+DIAG_TARBALL="$DIAG_INVOKED_FROM/sbcl-bridge-test-diagnostics-$(date +%Y%m%d-%H%M%S).tar.gz"
+
+# Mirror everything this script prints, stdout and stderr both, into
+# the bundle -- exactly what was seen on the terminal, still shown
+# live there too. This is usually the single most useful artifact when
+# something fails on a machine nobody else can log into.
+exec > >(tee "$DIAG_DIR/transcript.log") 2>&1
+
+# save_bridge_logs LABEL DIR -- copy DIR's logs (and a couple of other
+# cheap, occasionally-useful files) into the bundle under LABEL,
+# before DIR is torn down by this script's own cleanup. A bridge that
+# never actually got as far as writing anything (e.g. one of the
+# preflight-check directories, where a bridge is never even started)
+# just results in an empty or absent subdirectory -- never a failure.
+save_bridge_logs() {
+  local dir="$2" dest="$DIAG_DIR/logs/$1"
+  [ -d "$dir" ] || return 0
+  mkdir -p "$dest"
+  local f
+  for f in sbcl-output.log sbcl-input.log .sbcl-bridge.pid; do
+    [ -e "$dir/$f" ] && cp "$dir/$f" "$dest/$f" 2>/dev/null
+  done
+  [ -d "$dir/processed" ] && cp -r "$dir/processed" "$dest/" 2>/dev/null
+  find "$dir" -maxdepth 2 -name '*.version' -exec cp {} "$dest/" \; 2>/dev/null
+}
+
+# One-time snapshot of everything about the environment that could
+# plausibly explain a machine-specific result: versions, resource
+# limits, what's actually on PATH, and every SBCL_*/QUICKLISP_*
+# variable this tooling reads. None of this is secret -- paths and
+# version strings, nothing that looks like a credential -- so it's
+# always captured, not just on failure.
+save_environment_snapshot() {
+  {
+    echo "=== date ==="
+    date
+    echo
+    echo "=== uname -a ==="
+    uname -a
+    echo
+    echo "=== ${SBCL_BIN:-sbcl} --version ==="
+    "${SBCL_BIN:-sbcl}" --version 2>&1
+    echo
+    echo "=== nproc / memory ==="
+    echo "nproc: $(nproc 2>/dev/null || echo unknown)"
+    free -h 2>/dev/null || echo "(free not available)"
+    echo
+    echo "=== bash version ==="
+    echo "$BASH_VERSION"
+    echo
+    echo "=== relevant environment variables ==="
+    local v
+    for v in SBCL_BRIDGE_DIR SBCL_BRIDGE_LISP SBCL_BIN \
+             QUICKLISP_HOME QUICKLISP_LISP \
+             SBCL_POLL_INTERVAL SBCL_REQUEST_TIMEOUT SBCL_TIMEOUT \
+             SBCL_CORE_RETAIN SBCL_PROCESSED_RETAIN SBCL_LOG_MAX_BYTES \
+             SBCL_LOG_RETAIN SBCL_MEM_WARN_MB SBCL_STOP_TIMEOUT \
+             SBCL_SUSPEND_TIMEOUT HOME SHELL PATH; do
+      printf '%s=%s\n' "$v" "${!v-<unset>}"
+    done
+    echo
+    echo "=== curl / wget availability ==="
+    if command -v curl >/dev/null 2>&1; then
+      echo "curl: $(command -v curl)"
+      curl --version 2>&1 | head -1
+    else
+      echo "curl: not found"
+    fi
+    if command -v wget >/dev/null 2>&1; then
+      echo "wget: $(command -v wget)"
+      wget --version 2>&1 | head -1
+    else
+      echo "wget: not found"
+    fi
+    echo
+    echo "=== script file sizes (rough version fingerprint) ==="
+    wc -l "$CTL" "$CLIENT" "$SCRIPT_DIR/sbcl-bridge-test.sh" "$SBCL_BRIDGE_LISP" 2>/dev/null
+  } > "$DIAG_DIR/environment.txt" 2>&1
+}
+save_environment_snapshot
+
+# package_diagnostics -- called once, from cleanup(), as the last
+# thing this script does. Extracts a quick PASS/FAIL-only summary from
+# the transcript (for a fast look without wading through everything),
+# tars up the staging directory, and removes the staging directory so
+# only the single tarball is left behind.
+package_diagnostics() {
+  grep -E '^(PASS|FAIL):' "$DIAG_DIR/transcript.log" > "$DIAG_DIR/summary.txt" 2>/dev/null || true
+  echo "$PASS passed, $FAIL failed" >> "$DIAG_DIR/summary.txt"
+  ( cd "$DIAG_DIR" && tar czf "$DIAG_TARBALL" . ) 2>/dev/null
+  rm -rf "$DIAG_DIR"
+  echo
+  echo "Diagnostics bundle: $DIAG_TARBALL"
+}
 
 PASS=0
 FAIL=0
@@ -49,9 +166,62 @@ expect_exit() {
   fi
 }
 
+# wait_for_log_pattern DIR PATTERN [SIZE_BEFORE] [MAX_TRIES]
+#
+# Polls DIR/sbcl-output.log for PATTERN (a grep -q pattern), looking
+# only at content appended after SIZE_BEFORE bytes (so a log that
+# already contains a matching line from earlier in this test run
+# doesn't produce a false-positive the instant this is called).
+# Returns 0 once found, 1 after MAX_TRIES * 0.1s (default 15s).
+#
+# This exists because a fixed sleep is not a reliable way to know the
+# bridge has reached some later point in its startup sequence:
+# sbcl-bridge.lisp is loaded fresh via --load (compiled from source,
+# not a precompiled fasl) on every start, and how long that takes
+# varies with machine speed, system load, and how much code the file
+# has grown to contain -- a sleep comfortably long enough on one
+# machine can flake on a slower or busier one. Most checks in this
+# suite are naturally immune to this because they submit through
+# sbcl-client.sh, which already retries for up to SBCL_TIMEOUT on its
+# own; this helper is for the few checks that inspect
+# sbcl-output.log directly, with no such retry.
+wait_for_log_pattern() {
+  local pattern="$2" size_before="${3:-0}" max_tries="${4:-150}" i log="$1/sbcl-output.log"
+  for ((i = 0; i < max_tries; i++)); do
+    if [ -f "$log" ]; then
+      local cur_size
+      cur_size=$(wc -c < "$log" 2>/dev/null || echo 0)
+      if [ "$cur_size" -gt "$size_before" ] && \
+         tail -c +"$((size_before + 1))" "$log" 2>/dev/null | grep -Eq "$pattern"; then
+        echo "  (wait_for_log_pattern: '$pattern' seen after ~$(awk -v i="$i" 'BEGIN{printf "%.1f", i*0.1}')s)"
+        return 0
+      fi
+    fi
+    sleep 0.1
+  done
+  echo "  (wait_for_log_pattern: TIMED OUT after ${max_tries}0.1s waiting for '$pattern' in $log)"
+  echo "  --- new content of $log since byte $size_before (if any) ---"
+  if [ -f "$log" ]; then
+    tail -c +"$((size_before + 1))" "$log" 2>/dev/null | sed 's/^/  | /'
+  else
+    echo "  | (file does not exist)"
+  fi
+  echo "  --- end ---"
+  return 1
+}
+
+# wait_for_bridge_ready DIR [SIZE_BEFORE] [MAX_TRIES]
+# The common case of wait_for_log_pattern: wait for the bridge to have
+# fully started (the "SBCL-BRIDGE STARTED" banner).
+wait_for_bridge_ready() {
+  wait_for_log_pattern "$1" "SBCL-BRIDGE STARTED" "${2:-0}" "${3:-150}"
+}
+
 cleanup() {
   "$CTL" stop >/dev/null 2>&1 || true
+  save_bridge_logs "main" "$SBCL_BRIDGE_DIR"
   rm -rf "$SBCL_BRIDGE_DIR"
+  package_diagnostics
 }
 trap cleanup EXIT
 
@@ -75,7 +245,7 @@ RCEOF
 unset SBCL_HOME
 
 "$CTL" start >/dev/null || { echo "FATAL: bridge failed to start; check $SBCL_BRIDGE_DIR/sbcl-output.log"; exit 1; }
-sleep 0.7
+wait_for_bridge_ready "$SBCL_BRIDGE_DIR" || { echo "FATAL: bridge did not report ready in time; check $SBCL_BRIDGE_DIR/sbcl-output.log"; exit 1; }
 
 # --- Client preflight checks (before any bridge is running) ----------
 #
@@ -101,7 +271,140 @@ echo "$UNRELATED_PID" > "$PREFLIGHT_DIR/.sbcl-bridge.pid"
 expect_exit "client refuses a pid that isn't sbcl-like (recycled pid, exit 6)" 6 \
   env SBCL_BRIDGE_DIR="$PREFLIGHT_DIR" "$CLIENT" eval '(+ 1 1)'
 kill "$UNRELATED_PID" 2>/dev/null || true
+save_bridge_logs "preflight" "$PREFLIGHT_DIR"
 rm -rf "$PREFLIGHT_DIR"
+
+# --- Quicklisp integration: opt-in, reader-safety, graceful failure ----
+#
+# Full coverage of the sync logic itself (redirecting an
+# already-loaded Quicklisp's *quicklisp-home* and
+# *local-project-directories* when QUICKLISP_HOME changes between a
+# suspend and a resume) needs a real Quicklisp installation and isn't
+# included here, deliberately: it would make this otherwise
+# offline/fast suite depend on network reachability to
+# beta.quicklisp.org, which is exactly the kind of external dependency
+# this suite is designed to avoid. What's tested here is everything
+# that IS deterministic and network-independent: the feature is purely
+# opt-in (silent no-op with QUICKLISP_HOME unset), loading
+# sbcl-bridge.lisp can never break for users who don't use this
+# feature at all (see the comment at the top of the "Quicklisp
+# integration" section in sbcl-bridge.lisp for why that's a real risk
+# in Common Lisp and not just caution), and a QUICKLISP_HOME that
+# can't be satisfied degrades gracefully rather than affecting the
+# rest of the bridge.
+#
+# The "can't be satisfied" case is forced via QUICKLISP_INSTALLER_URL
+# (pointed at a guaranteed-unreachable local address), not by trying to
+# shadow curl/wget on PATH. An earlier version of this suite did the
+# latter, and it was a genuine, machine-dependent bug, not just
+# over-caution: SB-EXT:RUN-PROGRAM's :search silently falls through to
+# the NEXT candidate on PATH if the first one it finds exists but can't
+# actually be executed (a read-only or noexec-mounted temp directory is
+# enough to trigger this) -- so on at least one real machine, the
+# "fake" curl was skipped right past and the REAL one ran, reached the
+# real beta.quicklisp.org, and genuinely installed Quicklisp
+# successfully.
+#
+# QUICKLISP_INSTALLER_URL turned out not to be a complete fix either,
+# and this is worth understanding rather than just patching around: it
+# only controls step 4 of LOCATE-QUICKLISP-INSTALLER (downloading a
+# fresh copy of the quicklisp.lisp bootstrap SCRIPT). It has no effect
+# at all if steps 1-3 already find one -- in particular, a real machine
+# with Quicklisp's Debian/Ubuntu package installed at the usual system
+# path (§8.7) supplies a perfectly good installer via step 2, and this
+# override is never even consulted. And even in the case this override
+# DOES apply, it only blocks fetching the bootstrap SCRIPT -- once
+# INSTALL-QUICKLISP-IF-NEEDED has ANY usable installer in hand, from
+# ANY of the four sources, calling quicklisp-quickstart:install does
+# its OWN, completely separate round of network I/O against
+# hardcoded beta.quicklisp.org URLs baked into that script, which
+# nothing in sbcl-bridge.lisp has any hook into at all.
+#
+# Put simply: there is no environment variable, PATH trick, or other
+# portable mechanism available to this test that can reliably force
+# Quicklisp installation to fail on a machine that has a real,
+# legitimate path to a working Quicklisp -- and trying to characterize
+# every such path well enough to block all of them turned out to be a
+# losing battle. A genuine, successful install on such a machine isn't
+# a bug to work around; it's this feature working correctly. So rather
+# than forcing one specific outcome, this test accepts EITHER a
+# successful install or a graceful failure as correct, and asserts the
+# one thing that actually matters regardless of which happens: the
+# bridge stays healthy and usable either way. QUICKLISP_INSTALLER_URL
+# is still set below -- it's real, useful, documented behavior (an
+# internal-mirror override) worth exercising even though it can't be
+# relied on alone to force this test's outcome.
+QL_TEST_DIR="$(mktemp -d)"
+
+if env -u QUICKLISP_HOME -u QUICKLISP_LISP \
+     SBCL_BRIDGE_DIR="$QL_TEST_DIR/unset" SBCL_BRIDGE_LISP="$SBCL_BRIDGE_LISP" \
+     "$CTL" start >/dev/null 2>&1; then
+  if wait_for_bridge_ready "$QL_TEST_DIR/unset" && \
+     ! grep -q QUICKLISP "$QL_TEST_DIR/unset/sbcl-output.log"; then
+    ok "Quicklisp support is a silent no-op with QUICKLISP_HOME unset"
+  else
+    bad "Quicklisp support is a silent no-op with QUICKLISP_HOME unset"
+  fi
+  SBCL_BRIDGE_DIR="$QL_TEST_DIR/unset" "$CTL" stop >/dev/null 2>&1
+else
+  bad "Quicklisp support is a silent no-op with QUICKLISP_HOME unset (bridge failed to start)"
+fi
+
+if sbcl --noinform --non-interactive --no-sysinit --no-userinit \
+     --eval "(load \"$SBCL_BRIDGE_LISP\")" \
+     --eval '(princ (list :ql (find-package "QL") :ql-setup (find-package "QL-SETUP")))' \
+     2>/dev/null | grep -qF '(QL NIL QL-SETUP NIL)'; then
+  ok "loading sbcl-bridge.lisp never creates Quicklisp packages by itself"
+else
+  bad "loading sbcl-bridge.lisp never creates Quicklisp packages by itself"
+fi
+
+if env -u QUICKLISP_LISP \
+     QUICKLISP_HOME="$QL_TEST_DIR/never-installed" \
+     QUICKLISP_INSTALLER_URL="http://127.0.0.1:1/quicklisp.lisp" \
+     SBCL_BRIDGE_DIR="$QL_TEST_DIR/degrade" SBCL_BRIDGE_LISP="$SBCL_BRIDGE_LISP" \
+     "$CTL" start >/dev/null 2>&1; then
+  # Wait for the install ATTEMPT to actually finish, one way or the
+  # other, not just for the bridge to have started -- a real install
+  # (network reachable, or a system-installed quicklisp.lisp found)
+  # takes noticeably longer than a fast local failure, and both are
+  # valid outcomes here.
+  if wait_for_log_pattern "$QL_TEST_DIR/degrade" \
+       "installed at|continuing without .*this session|install failed" \
+       0 300; then
+    DEGRADE_LOG="$QL_TEST_DIR/degrade/sbcl-output.log"
+    BRIDGE_OK=0
+    env SBCL_BRIDGE_DIR="$QL_TEST_DIR/degrade" "$CLIENT" eval '(+ 40 2)' 2>/dev/null \
+      | grep -q '^;;; => 42$' && BRIDGE_OK=1
+
+    QL_OK=1
+    if grep -q "QUICKLISP: installed at" "$DEGRADE_LOG"; then
+      echo "  (this machine has a real path to Quicklisp -- a genuine install succeeded, which is correct)"
+      env SBCL_BRIDGE_DIR="$QL_TEST_DIR/degrade" "$CLIENT" \
+        eval "(and (find-package \"QL-SETUP\")
+                    (equal (truename ql:*quicklisp-home*)
+                           (truename #P\"$QL_TEST_DIR/never-installed/\")))" \
+        2>/dev/null | grep -q '^;;; => T$' || QL_OK=0
+    else
+      echo "  (this machine could not complete a real install -- confirming graceful degradation instead)"
+    fi
+
+    if [ "$BRIDGE_OK" -eq 1 ] && [ "$QL_OK" -eq 1 ]; then
+      ok "Quicklisp install attempt (success or failure) leaves the bridge usable"
+    else
+      bad "Quicklisp install attempt (success or failure) leaves the bridge usable"
+    fi
+  else
+    bad "Quicklisp install attempt (success or failure) leaves the bridge usable (no terminal QUICKLISP message seen)"
+  fi
+  SBCL_BRIDGE_DIR="$QL_TEST_DIR/degrade" "$CTL" stop >/dev/null 2>&1
+else
+  bad "Quicklisp install attempt (success or failure) leaves the bridge usable (bridge failed to start)"
+fi
+
+save_bridge_logs "quicklisp-unset" "$QL_TEST_DIR/unset"
+save_bridge_logs "quicklisp-degrade" "$QL_TEST_DIR/degrade"
+rm -rf "$QL_TEST_DIR"
 
 # --- Basic evaluation ------------------------------------------------
 
@@ -251,12 +554,13 @@ else
   bad "suspend leaves no working file behind"
 fi
 
+SIZE_BEFORE_RESUME=$(wc -c < "$SBCL_BRIDGE_DIR/sbcl-output.log" 2>/dev/null || echo 0)
 if "$CTL" resume >/dev/null 2>&1; then
   ok "resume restarts from the saved core"
 else
   bad "resume restarts from the saved core"
 fi
-sleep 0.7
+wait_for_bridge_ready "$SBCL_BRIDGE_DIR" "$SIZE_BEFORE_RESUME"
 
 LEFTOVERS=("$SBCL_BRIDGE_DIR"/processed/leftover-*.lisp)
 if [ -e "${LEFTOVERS[0]}" ]; then
@@ -297,7 +601,7 @@ if [ -n "$MOVED_CORE" ]; then
   ORIG_BRIDGE_DIR="$SBCL_BRIDGE_DIR"
   export SBCL_BRIDGE_DIR="$MOVED_DIR"
   "$CTL" resume >/dev/null 2>&1
-  sleep 0.7
+  wait_for_bridge_ready "$MOVED_DIR"
   if "$CLIENT" eval '*moved-marker*' 2>/dev/null | grep -q ':STILL-HERE'; then
     ok "resume honors SBCL_BRIDGE_DIR pointing at a moved workspace"
   else
@@ -307,11 +611,13 @@ if [ -n "$MOVED_CORE" ]; then
 
   # Restore the original bridge dir and state for the remaining tests.
   export SBCL_BRIDGE_DIR="$ORIG_BRIDGE_DIR"
+  SIZE_BEFORE_RESUME=$(wc -c < "$SBCL_BRIDGE_DIR/sbcl-output.log" 2>/dev/null || echo 0)
   "$CTL" resume >/dev/null 2>&1
-  sleep 0.7
+  wait_for_bridge_ready "$SBCL_BRIDGE_DIR" "$SIZE_BEFORE_RESUME"
 else
   bad "resume honors SBCL_BRIDGE_DIR pointing at a moved workspace (no core found)"
 fi
+save_bridge_logs "moved-workspace" "$MOVED_DIR"
 rm -rf "$MOVED_DIR"
 
 # Contrib REQUIRE after a resume: exercises the SBCL_HOME sidecar
@@ -333,8 +639,9 @@ fi
 XENV_SIDECAR="$(ls -t "$SBCL_BRIDGE_DIR"/cores/*.version 2>/dev/null | head -1)"
 if [ -n "$XENV_SIDECAR" ]; then
   sed -i '3s|.*|/nonexistent-host-prefix/lib/sbcl/|' "$XENV_SIDECAR"
+  SIZE_BEFORE_RESUME=$(wc -c < "$SBCL_BRIDGE_DIR/sbcl-output.log" 2>/dev/null || echo 0)
   "$CTL" resume >/dev/null 2>&1
-  sleep 0.7
+  wait_for_bridge_ready "$SBCL_BRIDGE_DIR" "$SIZE_BEFORE_RESUME"
   if "$CLIENT" eval '(require :sb-cover) :cross-env-ok' 2>/dev/null | grep -q ':CROSS-ENV-OK'; then
     ok "cross-environment resume restores a usable SBCL_HOME"
   else
