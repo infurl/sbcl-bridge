@@ -1491,15 +1491,6 @@ Two things differ from the `XDG_CACHE_HOME` case, both worth knowing:
   useful) question than comparing configuration strings. So this bridge keeps
   its own record, `*synced-cl-source-registry*`, of the raw environment string
   last synced against — preserved across suspend/resume like everything else
-  baked into the image.
-
-- **No single ASDF-owned variable to compare against.** `uiop:*user-cache*`
-  gave §8.8 something to directly compare a freshly-computed value against;
-  `*source-registry*` is the computed hash-table *result*, not an input, and
-  comparing two hash tables for content-equality is a different (and less
-  useful) question than comparing configuration strings. So this bridge keeps
-  its own record, `*synced-cl-source-registry*`, of the raw environment string
-  last synced against — preserved across suspend/resume like everything else
   baked into the image. That comparison is a plain string `equal`,
   deliberately not `paths-equal-p` (§8.4's truename-based comparison) — and
   not just because `paths-equal-p` requires the path to exist, the reason it
