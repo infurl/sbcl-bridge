@@ -290,7 +290,7 @@ bridges it starts:
 ```bash
 ./sbcl-bridge-test.sh
 # ...
-# == 37 passed, 0 failed ==
+# == 44 passed, 0 failed ==
 #
 # Diagnostics bundle: /path/you/ran/this/from/sbcl-bridge-test-diagnostics-20260101-120000.tar.gz
 ```
@@ -1093,19 +1093,20 @@ invocation style.
 
   Beyond `SBCL_HOME` and the watched directory, one more category of
   moved-image risk exists but is **not** something `sbcl-bridge` itself can
-  fix, because it lives entirely in what *your own* setup code does: Quicklisp
-  and ASDF bake absolute paths into their own caches too (`dist` directories,
-  `ql:*quicklisp-home*`, compiled fasl locations under `XDG_CACHE_HOME`,
-  ASDF's source-registry). If a setup script is run once, baked into a
-  suspended image, and then the image is resumed somewhere those paths don't
-  resolve the same way, you can hit an analogous class of failure — just one
-  this tooling has no visibility into. The practical mitigation is the mirror
-  image of the advice above: either make sure `QUICKLISP_HOME` and
-  `XDG_CACHE_HOME` (or wherever your setup script points) resolve to
-  *identical* absolute paths in every environment that will resume the image —
-  unlike the bridge's own workspace, which is expected to differ — or re-run
-  the setup script fresh after resuming in a new environment rather than
-  relying on state baked in before the move.
+  fix, because it lives entirely in what *your own* setup code does: anything
+  a setup script bakes in as an absolute path outside of Quicklisp's home and
+  ASDF's fasl cache — both of which this tooling *does* relocate automatically
+  (§8.7, §8.8) — such as a project-specific `local-projects/` symlink target,
+  or a hardcoded path inside your own system definitions. If a setup script is
+  run once, baked into a suspended image, and then the image is resumed
+  somewhere those paths don't resolve the same way, you can hit an analogous
+  class of failure — just one this tooling has no visibility into. The
+  practical mitigation is the mirror image of the advice above: either make
+  sure such paths resolve to *identical* absolute locations in every
+  environment that will resume the image — unlike the bridge's own workspace,
+  `QUICKLISP_HOME`, and `XDG_CACHE_HOME`, which are all expected to differ —
+  or re-run the setup script fresh after resuming in a new environment rather
+  than relying on state baked in before the move.
 
   One thing that turned out **not** to need any fix, verified directly rather
   than assumed: `*default-pathname-defaults*`, which governs how relative
@@ -1334,15 +1335,205 @@ isn't already present — breaking the bridge for every user, including everyone
 who never sets `QUICKLISP_HOME` — rather than failing gracefully only for the
 one feature that actually needs it.
 
-**What this doesn't cover.** Compiled fasl caches under `XDG_CACHE_HOME`, and
-anything a setup script itself bakes in as an absolute path (e.g. a
-project-specific `local-projects/` symlink target), are outside what this
-feature manages — see §8.4's note on this same category of risk for
-`SBCL_HOME`. The practical mitigation is the same: keep `XDG_CACHE_HOME`
-resolving to an identical absolute path in every environment that will resume
-the image, since — unlike `QUICKLISP_HOME` and the bridge's own workspace,
-which are expected to differ — there's no equivalent built-in correction for
-it.
+**What this doesn't cover.** Anything a setup script itself bakes in as an
+absolute path (e.g. a project-specific `local-projects/` symlink target) is
+outside what this feature manages — see §8.4's closing note on this same
+category of risk. Compiled fasl caches under `XDG_CACHE_HOME`, previously also
+in this category, are now handled — see §8.8.
+
+### 8.8 ASDF cache relocation
+
+If `XDG_CACHE_HOME` is set in the environment and ASDF is already loaded in
+this image — whether as a side effect of Quicklisp (§8.7), or standalone via a
+plain `(require :asdf)` — the bridge makes sure ASDF's compiled-fasl output
+cache is pointed at the *current* `XDG_CACHE_HOME` on every `run-bridge`
+start, the same way it does for Quicklisp's own home directory.
+
+```bash
+export XDG_CACHE_HOME=/workspace/cache
+./sbcl-bridge-ctl.sh start
+# (nothing logged yet -- ASDF isn't loaded until something requires it)
+./sbcl-client.sh eval '(require :asdf)'
+./sbcl-bridge-ctl.sh suspend
+# ... resume somewhere XDG_CACHE_HOME is /different/cache ...
+./sbcl-bridge-ctl.sh resume
+# sbcl-output.log:
+# ;;; ASDF: XDG_CACHE_HOME changed: /workspace/cache/common-lisp/... -> /different/cache/common-lisp/...
+```
+
+**Why this exists.** This surfaced directly from real use of the
+`QUICKLISP_HOME`/`XDG_CACHE_HOME` relocation described in §8.7: even with
+Quicklisp itself correctly redirected, a resumed bridge kept compiling (or
+looking for) fasls under the *old* cache directory. Investigated the same way
+as the Quicklisp case — reading ASDF/UIOP's actual source
+(`github.com/fare/asdf`, version 3.3.6.2, matching what current SBCL bundles)
+rather than assuming — rather than patched around blind.
+
+**What's actually cached, and why fixing it takes two steps, not one.** UIOP's
+`uiop/configuration` computes a special variable, `uiop:*user-cache*`, via
+`(xdg-cache-home "common-lisp" :implementation)` — reading `XDG_CACHE_HOME`
+fresh — but only *once*: either when `uiop/configuration` is first loaded, or,
+in UIOP's own dump/restore workflow, via a registered image-restore hook. That
+second mechanism is exactly where this breaks down for `sbcl-bridge`: the
+function that would re-invoke the hook and refresh `*user-cache*` on a resume,
+`uiop:restore-image`, is something a program has to call explicitly from its
+*own* `:toplevel` — and `resume-bridge` doesn't; it's a plain custom
+`:toplevel` calling `run-bridge` directly, with no dependency on UIOP's
+dump/restore machinery. So `*user-cache*` just sits there, stale, exactly like
+`ql:*local-project-directories*` did in §8.7.
+
+Worse than the Quicklisp case in one respect, and this was verified directly
+rather than assumed, the same way the Quicklisp-home fix was: fixing
+`*user-cache*` alone is not enough. ASDF's `asdf/output-translations`
+maintains its *own* cache, the actual in-use translation table, computed from
+`*user-cache*` the first time `asdf:ensure-output-translations` runs — which
+happens automatically inside `asdf:find-system`, i.e. the first time anything
+is quickloaded or `asdf:load-system`'d. That computation happens once and is
+cached from then on; changing `*user-cache*` afterward, alone, has no effect
+on it. Confirmed by direct testing: computing output-translations under one
+`XDG_CACHE_HOME`, then changing `XDG_CACHE_HOME` and recomputing
+`*user-cache*` alone, still translated a test source path into the *old* cache
+directory — only additionally calling `asdf:initialize-output-translations`
+actually re-derives the real, in-use translation table from the refreshed
+`*user-cache*`. The bridge does both, via the stable, `EXTERNAL`-confirmed
+public symbols `uiop:xdg-cache-home`, `uiop:*user-cache*`, and
+`asdf:initialize-output-translations` — deliberately not the internal (and
+version-fragile) `uiop:compute-user-cache`, which turns out not to even be
+exported from the friendly `UIOP` package name at all.
+
+**The comparison that decides whether anything needs fixing is deliberately
+not the same one used for `SBCL_HOME`/`QUICKLISP_HOME`.** Those use a
+`TRUENAME`-based comparison (`paths-equal-p`) specifically so spelling
+differences like a trailing slash don't cause false positives — but `TRUENAME`
+requires the path to exist, and the ASDF cache directory routinely doesn't:
+ASDF creates it lazily, the first time it actually writes a fasl there, not
+when merely computing where one *would* go. A `TRUENAME`-based comparison here
+would fail to resolve both sides in that common case and spuriously report a
+change on every resume even when `XDG_CACHE_HOME` never moved — caught
+directly, the same way the trailing-slash bug in §8.4 was, by actually running
+the "nothing changed" case rather than only the "something changed" one. Since
+both values being compared come from the identical `uiop:xdg-cache-home` call
+(just at different times), a plain pathname `EQUAL` is the correct,
+existence-independent comparison, and is what's used instead.
+
+**As with Quicklisp,** every symbol this touches is resolved indirectly
+(`dynamic-symbol`/`dynamic-value`/`dynamic-call`, the same helpers §8.7 uses,
+promoted to this file's general Helpers section since they're no longer
+Quicklisp-specific) rather than written as a literal `asdf:` or `uiop:` symbol
+in the source — for the identical reader-error reason: ASDF is not auto-loaded
+by SBCL, and plenty of systems never `(require :asdf)` at all.
+
+**What this doesn't cover.** ASDF's `*source-registry*` — where ASDF looks to
+*find* systems, as opposed to where it puts compiled output — has an analogous
+once-computed cache, checked directly against the source the same way this
+section's own findings were, but driven by `CL_SOURCE_REGISTRY`, not
+`XDG_CACHE_HOME`. It's not out of scope, exactly — see §8.9, which relocates
+it independently, since it's a genuinely separate mechanism with its own
+trigger variable, not a side effect of anything above.
+
+### 8.9 `CL_SOURCE_REGISTRY` relocation
+
+If `CL_SOURCE_REGISTRY` is set in the environment and ASDF is already loaded
+in this image, the bridge makes sure ASDF's source-registry — where it looks
+to *find* systems, independent of Quicklisp entirely — reflects the *current*
+`CL_SOURCE_REGISTRY` on every `run-bridge` start, the same way §8.7 and §8.8
+relocate Quicklisp's home and ASDF's fasl cache.
+
+```bash
+export CL_SOURCE_REGISTRY=/workspace/my-project//
+./sbcl-bridge-ctl.sh start
+./sbcl-client.sh eval '(require :asdf)'
+./sbcl-bridge-ctl.sh suspend
+# ... resume somewhere CL_SOURCE_REGISTRY is /different/project// ...
+./sbcl-bridge-ctl.sh resume
+# sbcl-output.log:
+# ;;; ASDF: CL_SOURCE_REGISTRY changed: /workspace/my-project// -> /different/project//
+```
+
+**Why this is a separate feature, not folded into §8.7 or §8.8.**
+`CL_SOURCE_REGISTRY` serves users who never touch Quicklisp at all — a
+hand-picked list of local project directories ASDF should search for `.asd`
+files, entirely independent of where Quicklisp's own dist-managed systems
+live. Making it relocatable is worth doing on its own merits: it's what lets a
+coding agent rely on `CL_SOURCE_REGISTRY` for its own project systems without
+needing to care whether the bridge happens to move between environments — most
+users won't be doing the kind of shared-workspace, cache-portability stress
+test that motivated §8.7 and §8.8 in the first place, but plenty rely on
+`CL_SOURCE_REGISTRY` regardless, and this makes that reliable too.
+
+**The mechanism, and the two respects in which it differs from §8.8's.**
+Investigated identically to the ASDF cache case: ASDF's `asdf/source-registry`
+computes a special variable, `asdf:*source-registry*` — a hash table mapping
+system names to `.asd` pathnames — the first time anything calls
+`asdf:find-system`, via `asdf:ensure-source-registry`. That computation
+happens once; `ensure-source-registry` is explicitly documented, in ASDF's own
+source comments, as a no-op once `*source-registry*` is already a hash table,
+regardless of whether `CL_SOURCE_REGISTRY` has changed since. UIOP's own
+mechanism for resetting this before a save — `clear-configuration`, which
+`clear-source-registry` is registered against — is wired to an image-*dump*
+hook (`uiop:dump-image`'s, specifically), which `resume-bridge`'s plain
+`sb-ext:save-lisp-and-die` call never goes through, so it never fires for us —
+the same reason the analogous image-*restore* hook never fires for
+`uiop:*user-cache*` in §8.8. Confirmed directly, the same way that was: built
+two real directories, each with its own trivial `.asd` system, pointed
+`CL_SOURCE_REGISTRY` at one, loaded it, then changed `CL_SOURCE_REGISTRY` to
+the other and called `ensure-source-registry` again alone — the system that
+only existed in the new location was still not found. Only an explicit
+`clear-source-registry` followed by `initialize-source-registry` picked it up,
+and that's what the bridge does.
+
+Two things differ from the `XDG_CACHE_HOME` case, both worth knowing:
+
+- **No single ASDF-owned variable to compare against.** `uiop:*user-cache*`
+  gave §8.8 something to directly compare a freshly-computed value against;
+  `*source-registry*` is the computed hash-table *result*, not an input, and
+  comparing two hash tables for content-equality is a different (and less
+  useful) question than comparing configuration strings. So this bridge keeps
+  its own record, `*synced-cl-source-registry*`, of the raw environment string
+  last synced against — preserved across suspend/resume like everything else
+  baked into the image.
+
+- **No single ASDF-owned variable to compare against.** `uiop:*user-cache*`
+  gave §8.8 something to directly compare a freshly-computed value against;
+  `*source-registry*` is the computed hash-table *result*, not an input, and
+  comparing two hash tables for content-equality is a different (and less
+  useful) question than comparing configuration strings. So this bridge keeps
+  its own record, `*synced-cl-source-registry*`, of the raw environment string
+  last synced against — preserved across suspend/resume like everything else
+  baked into the image. That comparison is a plain string `equal`,
+  deliberately not `paths-equal-p` (§8.4's truename-based comparison) — and
+  not just because `paths-equal-p` requires the path to exist, the reason it
+  was wrong for §8.8's cache directory. Here it would be wrong on its own
+  terms: `CL_SOURCE_REGISTRY`'s own syntax gives a single trailing slash and a
+  double trailing slash different meanings (`:directory` versus `:tree` — see
+  the quick-reference callout in §11), so resolving `/foo/` and `/foo//` down
+  to the same canonical path, the way `truename` would, would erase a
+  distinction ASDF itself treats as meaningful, not merely normalize away an
+  incidental spelling difference.
+
+- **That record is deliberately updated regardless of whether ASDF happens to
+  be loaded yet.** This one was a real bug caught before shipping, not just a
+  theoretical concern: `ensure-cl-source-registry-configured` runs once per
+  `run-bridge` start or resume, almost always *before* a user's own request
+  has gotten around to loading ASDF at all. An earlier version only recorded
+  its baseline when ASDF was already loaded — which, at the one moment this
+  function actually runs on an ordinary fresh start, it essentially never is.
+  The result: the baseline stayed unset for the entire pre-suspend session
+  even though a request loaded ASDF and correctly computed its source-registry
+  from that same, unchanged `CL_SOURCE_REGISTRY` moments later — and the
+  *next* resume, even with `CL_SOURCE_REGISTRY` completely unchanged, compared
+  a real string against that stale unset baseline and reported a spurious
+  "changed" every time. Recording the baseline unconditionally — regardless of
+  ASDF's load state — and gating only the *fix itself* (not the bookkeeping)
+  on ASDF being loaded fixed it. Caught the same way the §8.4 trailing-slash
+  bug was: by deliberately testing the "nothing actually changed" case, not
+  just the "something changed" one.
+
+**What this doesn't cover.** Quicklisp-managed systems bypass
+`*source-registry*` entirely via the search-functions mechanism
+`sync-quicklisp-home` already re-registers (§8.7's `ql:setup` call) — this
+section is specifically for systems ASDF finds through `CL_SOURCE_REGISTRY`
+itself.
 
 ---
 
@@ -1473,10 +1664,14 @@ Worth internalizing before you rely on this in production:
   machine that has a real path to one isn't a bug to work around; it's this
   feature working as intended.
 
-- **Quicklisp's own compiled-fasl and local-project caches are outside this
-  feature's scope** (§8.7's closing note) — the same category of risk as
-  `SBCL_HOME`, but for `XDG_CACHE_HOME` and anything a setup script bakes in
-  as an absolute path, with no equivalent built-in correction.
+- **Absolute paths a setup script bakes in on its own are outside anything
+  this tooling can see** — e.g. a project-specific `local-projects/` symlink
+  target, or a hardcoded path inside your own system definitions. Everything
+  this tooling itself controls (the bridge's watched directory, `SBCL_HOME`,
+  Quicklisp's home and local-project directories, ASDF's fasl cache, ASDF's
+  source-registry) is relocated automatically on resume — see §8.4, §8.7,
+  §8.8, §8.9 — but state your *own* code bakes in has no equivalent built-in
+  correction.
 
 ---
 
@@ -1579,6 +1774,27 @@ Worth internalizing before you rely on this in production:
     (double-check it's exported, and exported *before* `ctl.sh
     start`/`resume`, not just before submitting the request).
 
+- **Compiled systems keep rebuilding from source after a resume, or fasls pile
+  up in an old, no-longer-relevant directory**
+  - Classic symptom of ASDF's fasl cache still pointing at a stale
+    `XDG_CACHE_HOME` (§8.8). Check `sbcl-output.log` for a `;;; ASDF:
+    XDG_CACHE_HOME changed: ... -> ...` line around the most recent resume —
+    if it's there, the relocation happened and this is a different problem; if
+    it isn't, either `XDG_CACHE_HOME` wasn't actually set in the environment
+    the bridge itself was started/resumed with (same double-check as the
+    `QUICKLISP_HOME` entry above), or ASDF was never loaded in this image in
+    the first place (nothing to relocate — it'll compute correctly fresh the
+    moment something does `(require :asdf)`).
+
+- **`asdf:find-system` can't find a project system after a resume, even though
+  `CL_SOURCE_REGISTRY` is set correctly for this environment**
+  - Same shape as the previous entry, for ASDF's source-registry instead of
+    its fasl cache (§8.9). Check `sbcl-output.log` for a `;;; ASDF:
+    CL_SOURCE_REGISTRY changed: ... -> ...` line around the most recent
+    resume; if it isn't there, check the same two things as above (actually
+    exported before `ctl.sh start`/`resume`, and ASDF actually loaded in this
+    image already).
+
 - **A stray `sbcl` process left over from a previous test**
   - `ps aux | grep sbcl-bridge.lisp`, then `kill` it — `ctl.sh stop` only
     knows about the PID recorded in `.sbcl-bridge.pid` for *its*
@@ -1608,7 +1824,9 @@ Worth internalizing before you rely on this in production:
 # Setup (once per shell)
 export SBCL_BRIDGE_DIR=/path/to/bridge
 export SBCL_BRIDGE_LISP=/path/to/sbcl-bridge.lisp
-export QUICKLISP_HOME=/path/to/quicklisp   # optional; see §8.7
+export QUICKLISP_HOME=/path/to/quicklisp            # optional; see §8.7
+export XDG_CACHE_HOME=/path/to/cache                # optional; see §8.8
+export CL_SOURCE_REGISTRY=/path/to/systems//        # optional; see §8.9
 
 # Lifecycle
 ./sbcl-bridge-ctl.sh start

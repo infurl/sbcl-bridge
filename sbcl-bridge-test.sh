@@ -33,6 +33,33 @@
 
 set -u
 
+# Isolate this entire suite from Quicklisp/ASDF, unconditionally, before
+# anything else runs. ENSURE-QUICKLISP-CONFIGURED,
+# ENSURE-ASDF-CACHE-CONFIGURED, and ENSURE-CL-SOURCE-REGISTRY-CONFIGURED
+# (sbcl-bridge.lisp) all run on every single bridge start or resume,
+# gated only on whether QUICKLISP_HOME / XDG_CACHE_HOME /
+# CL_SOURCE_REGISTRY happen to be set in the environment -- not on
+# whether a given test has anything to do with any of the three. On a
+# machine where these are set ambiently (exactly the intended, expected
+# setup for real use), EVERY throwaway bridge this suite starts -- the
+# main one, the preflight-check ones, the moved-workspace one, all of
+# them -- would otherwise attempt real Quicklisp installs and real ASDF
+# compiles using the caller's REAL, persistent QUICKLISP_HOME and
+# XDG_CACHE_HOME, not just the tests actually built to exercise these
+# features. Found this exact way: a real user's real, shared cache
+# directory ended up with leftover fasls compiled under a throwaway
+# "never-installed" test path, because this suite was run in a shell
+# that had XDG_CACHE_HOME set for real work, and nothing here ever
+# isolated it. Unsetting these five here means every test EXCEPT the
+# ones that explicitly reintroduce one of them via its own `env
+# VAR=... ctl.sh ...` invocation (see the Quicklisp, ASDF cache, and
+# CL_SOURCE_REGISTRY sections below, each of which points these at
+# throwaway `mktemp -d` locations of its own) runs exactly as if none of
+# the three features existed at all -- which is the correct, isolated
+# default for a suite that has nothing to do with any of them for most
+# of its checks.
+unset QUICKLISP_HOME QUICKLISP_LISP QUICKLISP_INSTALLER_URL XDG_CACHE_HOME CL_SOURCE_REGISTRY
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CTL="$SCRIPT_DIR/sbcl-bridge-ctl.sh"
 CLIENT="$SCRIPT_DIR/sbcl-client.sh"
@@ -362,6 +389,7 @@ fi
 if env -u QUICKLISP_LISP \
      QUICKLISP_HOME="$QL_TEST_DIR/never-installed" \
      QUICKLISP_INSTALLER_URL="http://127.0.0.1:1/quicklisp.lisp" \
+     XDG_CACHE_HOME="$QL_TEST_DIR/cache" \
      SBCL_BRIDGE_DIR="$QL_TEST_DIR/degrade" SBCL_BRIDGE_LISP="$SBCL_BRIDGE_LISP" \
      "$CTL" start >/dev/null 2>&1; then
   # Wait for the install ATTEMPT to actually finish, one way or the
@@ -405,6 +433,187 @@ fi
 save_bridge_logs "quicklisp-unset" "$QL_TEST_DIR/unset"
 save_bridge_logs "quicklisp-degrade" "$QL_TEST_DIR/degrade"
 rm -rf "$QL_TEST_DIR"
+
+# --- ASDF output-translations (fasl cache) relocation -------------------
+#
+# Same class of bug as the Quicklisp-home sync above, and tested the
+# same way: force a real resume with XDG_CACHE_HOME changed, and check
+# that ASDF's actual in-use output-translations (not just the
+# intermediate uiop:*user-cache* variable) follow it. Unlike the
+# Quicklisp case, this doesn't need an "install" or "not yet loaded"
+# branch -- ASDF/UIOP either isn't loaded in the image yet (nothing to
+# fix; it'll compute correctly whenever it does get loaded) or it is,
+# in which case the only question is whether XDG_CACHE_HOME has moved
+# since. ASDF's own caching means (require :asdf) and the first real
+# use (asdf:ensure-output-translations, which asdf:find-system calls
+# internally) must be SEPARATE requests here, not one -- combined into
+# a single (progn ...), the reader would need to resolve the asdf:
+# symbols before (require :asdf) in the same form ever got a chance to
+# run, which is exactly the reader-error class of bug this file's own
+# indirection helpers exist to avoid.
+ASDF_TEST_DIR="$(mktemp -d)"
+
+if sbcl --noinform --non-interactive --no-sysinit --no-userinit \
+     --eval "(load \"$SBCL_BRIDGE_LISP\")" \
+     --eval '(princ (list :uiop (find-package "UIOP") :asdf (find-package "ASDF")))' \
+     2>/dev/null | grep -qF '(UIOP NIL ASDF NIL)'; then
+  ok "loading sbcl-bridge.lisp never creates ASDF/UIOP packages by itself"
+else
+  bad "loading sbcl-bridge.lisp never creates ASDF/UIOP packages by itself"
+fi
+
+if env -u XDG_CACHE_HOME SBCL_BRIDGE_DIR="$ASDF_TEST_DIR/unset" SBCL_BRIDGE_LISP="$SBCL_BRIDGE_LISP" \
+     "$CTL" start >/dev/null 2>&1; then
+  if wait_for_bridge_ready "$ASDF_TEST_DIR/unset" && \
+     ! grep -q "ASDF:" "$ASDF_TEST_DIR/unset/sbcl-output.log"; then
+    ok "ASDF cache relocation is a silent no-op with XDG_CACHE_HOME unset"
+  else
+    bad "ASDF cache relocation is a silent no-op with XDG_CACHE_HOME unset"
+  fi
+  env SBCL_BRIDGE_DIR="$ASDF_TEST_DIR/unset" "$CTL" stop >/dev/null 2>&1
+else
+  bad "ASDF cache relocation is a silent no-op with XDG_CACHE_HOME unset (bridge failed to start)"
+fi
+
+ASDF_CACHE_A="$ASDF_TEST_DIR/cache-a"
+ASDF_CACHE_B="$ASDF_TEST_DIR/cache-b"
+mkdir -p "$ASDF_CACHE_A" "$ASDF_CACHE_B"
+if env XDG_CACHE_HOME="$ASDF_CACHE_A" SBCL_BRIDGE_DIR="$ASDF_TEST_DIR/relocate" SBCL_BRIDGE_LISP="$SBCL_BRIDGE_LISP" \
+     "$CTL" start >/dev/null 2>&1; then
+  wait_for_bridge_ready "$ASDF_TEST_DIR/relocate"
+  env SBCL_BRIDGE_DIR="$ASDF_TEST_DIR/relocate" "$CLIENT" eval '(require :asdf)' >/dev/null 2>&1
+  BEFORE="$(env SBCL_BRIDGE_DIR="$ASDF_TEST_DIR/relocate" "$CLIENT" eval \
+    '(progn (asdf:ensure-output-translations) (namestring (asdf:apply-output-translations #P"/some/source/file.lisp")))' 2>/dev/null)"
+
+  # Unchanged resume must NOT log a spurious relocation -- this is the
+  # exact bug PATHS-EQUAL-P (truename-based) would have reintroduced
+  # here: the cache directory this points at has deliberately not been
+  # written to yet, so TRUENAME would fail to resolve it on both sides
+  # and spuriously report "different" even though nothing changed.
+  SIZE_BEFORE_UNCHANGED=$(wc -c < "$ASDF_TEST_DIR/relocate/sbcl-output.log" 2>/dev/null || echo 0)
+  env SBCL_BRIDGE_DIR="$ASDF_TEST_DIR/relocate" "$CTL" suspend >/dev/null 2>&1
+  env XDG_CACHE_HOME="$ASDF_CACHE_A" SBCL_BRIDGE_DIR="$ASDF_TEST_DIR/relocate" "$CTL" resume >/dev/null 2>&1
+  wait_for_bridge_ready "$ASDF_TEST_DIR/relocate" "$SIZE_BEFORE_UNCHANGED"
+  if tail -c +"$((SIZE_BEFORE_UNCHANGED + 1))" "$ASDF_TEST_DIR/relocate/sbcl-output.log" 2>/dev/null | grep -q "ASDF:"; then
+    bad "unchanged XDG_CACHE_HOME across a resume reports no spurious relocation"
+  else
+    ok "unchanged XDG_CACHE_HOME across a resume reports no spurious relocation"
+  fi
+
+  # Now the real test: resume with XDG_CACHE_HOME genuinely changed.
+  SIZE_BEFORE_CHANGED=$(wc -c < "$ASDF_TEST_DIR/relocate/sbcl-output.log" 2>/dev/null || echo 0)
+  env SBCL_BRIDGE_DIR="$ASDF_TEST_DIR/relocate" "$CTL" suspend >/dev/null 2>&1
+  env XDG_CACHE_HOME="$ASDF_CACHE_B" SBCL_BRIDGE_DIR="$ASDF_TEST_DIR/relocate" "$CTL" resume >/dev/null 2>&1
+  wait_for_bridge_ready "$ASDF_TEST_DIR/relocate" "$SIZE_BEFORE_CHANGED"
+  AFTER="$(env SBCL_BRIDGE_DIR="$ASDF_TEST_DIR/relocate" "$CLIENT" eval \
+    '(namestring (asdf:apply-output-translations #P"/some/source/file.lisp"))' 2>/dev/null)"
+
+  if printf '%s' "$BEFORE" | grep -qF "$ASDF_CACHE_A" \
+     && printf '%s' "$AFTER" | grep -qF "$ASDF_CACHE_B" \
+     && ! printf '%s' "$AFTER" | grep -qF "$ASDF_CACHE_A"; then
+    ok "resume with a changed XDG_CACHE_HOME relocates ASDF's fasl cache"
+  else
+    bad "resume with a changed XDG_CACHE_HOME relocates ASDF's fasl cache"
+  fi
+  env SBCL_BRIDGE_DIR="$ASDF_TEST_DIR/relocate" "$CTL" stop >/dev/null 2>&1
+else
+  bad "resume with a changed XDG_CACHE_HOME relocates ASDF's fasl cache (bridge failed to start)"
+fi
+
+save_bridge_logs "asdf-unset" "$ASDF_TEST_DIR/unset"
+save_bridge_logs "asdf-relocate" "$ASDF_TEST_DIR/relocate"
+rm -rf "$ASDF_TEST_DIR"
+
+# --- CL_SOURCE_REGISTRY relocation ---------------------------------------
+#
+# Same class of bug as the other two, and found the same way: two real
+# directories, each with its own trivial .asd system, so "is the right
+# system findable" can be checked directly rather than inferred from
+# compile output. Unlike the ASDF-cache tests, this doesn't need an
+# unreachable-network trick anywhere -- CL_SOURCE_REGISTRY just points
+# at local directories.
+#
+# The "unchanged resume must not report a false change" check here is
+# not paranoia for its own sake -- it's the exact bug this feature
+# shipped with initially. ENSURE-CL-SOURCE-REGISTRY-CONFIGURED runs
+# once per bridge start/resume, almost always BEFORE a user's own
+# request has gotten around to loading ASDF at all, so the first
+# version of this function only recorded its "last known
+# CL_SOURCE_REGISTRY" baseline when ASDF happened to already be loaded
+# -- which, on the ordinary first pre-suspend session, it never was at
+# the one moment this function got to check. The result: baseline
+# stayed NIL for the whole session even though a request loaded ASDF
+# and correctly computed its source-registry from that same,
+# unchanged CL_SOURCE_REGISTRY moments later -- and the NEXT resume,
+# even with CL_SOURCE_REGISTRY completely unchanged, would compare a
+# real string against that stale NIL and report a spurious "changed"
+# every single time.
+CSR_TEST_DIR="$(mktemp -d)"
+CSR_DIR_A="$CSR_TEST_DIR/systems-a"
+CSR_DIR_B="$CSR_TEST_DIR/systems-b"
+mkdir -p "$CSR_DIR_A" "$CSR_DIR_B"
+cat > "$CSR_DIR_A/smoke-test-system-a.asd" <<'EOF'
+(defsystem "smoke-test-system-a" :components ())
+EOF
+cat > "$CSR_DIR_B/smoke-test-system-b.asd" <<'EOF'
+(defsystem "smoke-test-system-b" :components ())
+EOF
+
+if env -u CL_SOURCE_REGISTRY SBCL_BRIDGE_DIR="$CSR_TEST_DIR/unset" SBCL_BRIDGE_LISP="$SBCL_BRIDGE_LISP" \
+     "$CTL" start >/dev/null 2>&1; then
+  if wait_for_bridge_ready "$CSR_TEST_DIR/unset" && \
+     ! grep -q "CL_SOURCE_REGISTRY" "$CSR_TEST_DIR/unset/sbcl-output.log"; then
+    ok "CL_SOURCE_REGISTRY relocation is a silent no-op with it unset"
+  else
+    bad "CL_SOURCE_REGISTRY relocation is a silent no-op with it unset"
+  fi
+  env SBCL_BRIDGE_DIR="$CSR_TEST_DIR/unset" "$CTL" stop >/dev/null 2>&1
+else
+  bad "CL_SOURCE_REGISTRY relocation is a silent no-op with it unset (bridge failed to start)"
+fi
+
+if env CL_SOURCE_REGISTRY="$CSR_DIR_A//" SBCL_BRIDGE_DIR="$CSR_TEST_DIR/relocate" SBCL_BRIDGE_LISP="$SBCL_BRIDGE_LISP" \
+     "$CTL" start >/dev/null 2>&1; then
+  wait_for_bridge_ready "$CSR_TEST_DIR/relocate"
+  env SBCL_BRIDGE_DIR="$CSR_TEST_DIR/relocate" "$CLIENT" eval '(require :asdf)' >/dev/null 2>&1
+  FOUND_A_BEFORE="$(env SBCL_BRIDGE_DIR="$CSR_TEST_DIR/relocate" "$CLIENT" eval \
+    '(not (null (asdf:find-system "smoke-test-system-a" nil)))' 2>/dev/null)"
+
+  # Unchanged resume must NOT log a spurious relocation -- this is the
+  # exact false positive described above.
+  SIZE_BEFORE_UNCHANGED=$(wc -c < "$CSR_TEST_DIR/relocate/sbcl-output.log" 2>/dev/null || echo 0)
+  env SBCL_BRIDGE_DIR="$CSR_TEST_DIR/relocate" "$CTL" suspend >/dev/null 2>&1
+  env CL_SOURCE_REGISTRY="$CSR_DIR_A//" SBCL_BRIDGE_DIR="$CSR_TEST_DIR/relocate" "$CTL" resume >/dev/null 2>&1
+  wait_for_bridge_ready "$CSR_TEST_DIR/relocate" "$SIZE_BEFORE_UNCHANGED"
+  if tail -c +"$((SIZE_BEFORE_UNCHANGED + 1))" "$CSR_TEST_DIR/relocate/sbcl-output.log" 2>/dev/null | grep -q "CL_SOURCE_REGISTRY"; then
+    bad "unchanged CL_SOURCE_REGISTRY across a resume reports no spurious relocation"
+  else
+    ok "unchanged CL_SOURCE_REGISTRY across a resume reports no spurious relocation"
+  fi
+
+  # Now the real test: resume with CL_SOURCE_REGISTRY genuinely changed.
+  SIZE_BEFORE_CHANGED=$(wc -c < "$CSR_TEST_DIR/relocate/sbcl-output.log" 2>/dev/null || echo 0)
+  env SBCL_BRIDGE_DIR="$CSR_TEST_DIR/relocate" "$CTL" suspend >/dev/null 2>&1
+  env CL_SOURCE_REGISTRY="$CSR_DIR_B//" SBCL_BRIDGE_DIR="$CSR_TEST_DIR/relocate" "$CTL" resume >/dev/null 2>&1
+  wait_for_bridge_ready "$CSR_TEST_DIR/relocate" "$SIZE_BEFORE_CHANGED"
+  RESULT_AFTER="$(env SBCL_BRIDGE_DIR="$CSR_TEST_DIR/relocate" "$CLIENT" eval \
+    '(list (not (null (asdf:find-system "smoke-test-system-a" nil)))
+           (not (null (asdf:find-system "smoke-test-system-b" nil))))' 2>/dev/null)"
+
+  if printf '%s' "$FOUND_A_BEFORE" | grep -q '^;;; => T$' \
+     && printf '%s' "$RESULT_AFTER" | grep -q '(T T)'; then
+    ok "resume with a changed CL_SOURCE_REGISTRY relocates ASDF's source registry"
+  else
+    bad "resume with a changed CL_SOURCE_REGISTRY relocates ASDF's source registry"
+  fi
+  env SBCL_BRIDGE_DIR="$CSR_TEST_DIR/relocate" "$CTL" stop >/dev/null 2>&1
+else
+  bad "resume with a changed CL_SOURCE_REGISTRY relocates ASDF's source registry (bridge failed to start)"
+fi
+
+save_bridge_logs "cl-source-registry-unset" "$CSR_TEST_DIR/unset"
+save_bridge_logs "cl-source-registry-relocate" "$CSR_TEST_DIR/relocate"
+rm -rf "$CSR_TEST_DIR"
 
 # --- Basic evaluation ------------------------------------------------
 

@@ -286,6 +286,50 @@ hand, which is what this function does."
          :defaults p)
         p)))
 
+;;; DYNAMIC-SYMBOL/DYNAMIC-VALUE/DYNAMIC-CALL: safe indirect access to
+;;; symbols in packages that may not exist yet (Quicklisp's ql/ql-setup/
+;;; ql-dist/quicklisp-quickstart, and ASDF/UIOP's internal packages --
+;;; see the Quicklisp integration and ASDF cache relocation sections
+;;; below for where and why). This is not a stylistic preference: in
+;;; Common Lisp, a literal reference to a symbol in a package that
+;;; doesn't exist -- writing ql:quickload or asdf:initialize-output-
+;;; translations directly in source text -- is a READER error, which
+;;; happens while this FILE is merely being read, before any code from
+;;; it has run. That would break loading sbcl-bridge.lisp entirely, for
+;;; every user, including ones who never set QUICKLISP_HOME or
+;;; XDG_CACHE_HOME. Resolving everything through FIND-PACKAGE/FIND-SYMBOL
+;;; on plain strings defers that resolution to runtime, after the
+;;; relevant package is known (or not) to exist.
+
+(defun dynamic-symbol (package-name symbol-name)
+  "Find SYMBOL-NAME (a string) in PACKAGE-NAME (a string), or NIL if
+either the package or the symbol doesn't exist."
+  (let ((package (find-package package-name)))
+    (and package (find-symbol symbol-name package))))
+
+(defun dynamic-value (package-name symbol-name)
+  "SYMBOL-VALUE of PACKAGE-NAME:SYMBOL-NAME (both strings), or NIL if
+the package, symbol, or binding doesn't exist."
+  (let ((sym (dynamic-symbol package-name symbol-name)))
+    (and sym (boundp sym) (symbol-value sym))))
+
+(defun (setf dynamic-value) (new-value package-name symbol-name)
+  "Set PACKAGE-NAME:SYMBOL-NAME (both strings) to NEW-VALUE. Errors if
+the package or symbol doesn't exist -- unlike DYNAMIC-VALUE's read
+side, there's no sensible NIL fallback for a set that silently didn't
+happen, so callers should confirm the target is expected to exist
+(e.g. by checking FIND-PACKAGE first) before setting through this."
+  (let ((sym (dynamic-symbol package-name symbol-name)))
+    (unless sym (error "~a:~a not found" package-name symbol-name))
+    (setf (symbol-value sym) new-value)))
+
+(defun dynamic-call (package-name symbol-name &rest args)
+  "Like (funcall (find-symbol ...) ...), resolved from strings. Errors
+if the package or symbol doesn't exist."
+  (let ((sym (dynamic-symbol package-name symbol-name)))
+    (unless sym (error "~a:~a not found" package-name symbol-name))
+    (apply sym args)))
+
 (defun slurp-file (path)
   "Read the entire contents of PATH as a string."
   (with-open-file (in path :direction :input :element-type 'character
@@ -613,17 +657,19 @@ request-cancelled condition."
 ;;; for that session, available to try again on the next resume.
 ;;;
 ;;; A note on style: essentially everything Quicklisp-related below is
-;;; accessed indirectly through QL-SYMBOL/QL-VALUE/QL-CALL rather than
-;;; as ordinary package-qualified symbols like QL:QUICKLOAD. This is
-;;; not a stylistic preference -- writing a literal reference to a
-;;; symbol in a package that doesn't exist yet (ql, ql-setup,
-;;; ql-dist, quicklisp-quickstart -- none of which exist on a system
-;;; that has never loaded Quicklisp) is a READER error in Common Lisp,
-;;; not a runtime error: it would prevent this FILE from loading at
-;;; all, for every user, including those who never set QUICKLISP_HOME.
-;;; Resolving everything through FIND-PACKAGE/FIND-SYMBOL on strings
-;;; defers that resolution to runtime, after the relevant package is
-;;; known to exist.
+;;; accessed indirectly through DYNAMIC-SYMBOL/DYNAMIC-VALUE/DYNAMIC-CALL
+;;; (defined in the Helpers section above) rather than as ordinary
+;;; package-qualified symbols like QL:QUICKLOAD. This is not a
+;;; stylistic preference -- writing a literal reference to a symbol in
+;;; a package that doesn't exist yet (ql, ql-setup, ql-dist,
+;;; quicklisp-quickstart -- none of which exist on a system that has
+;;; never loaded Quicklisp) is a READER error in Common Lisp, not a
+;;; runtime error: it would prevent this FILE from loading at all, for
+;;; every user, including those who never set QUICKLISP_HOME. Resolving
+;;; everything through FIND-PACKAGE/FIND-SYMBOL on strings defers that
+;;; resolution to runtime, after the relevant package is known to
+;;; exist. The same concern applies to ASDF/UIOP below, in the
+;;; following section -- see its own note.
 
 (defparameter *quicklisp-installer-url* "https://beta.quicklisp.org/quicklisp.lisp"
   "Default URL to download a quicklisp.lisp bootstrap installer from,
@@ -640,36 +686,6 @@ real internet (see sbcl-bridge-test.sh).")
 else *quicklisp-installer-url*."
   (let ((env (sb-ext:posix-getenv "QUICKLISP_INSTALLER_URL")))
     (if (and env (plusp (length env))) env *quicklisp-installer-url*)))
-
-(defun ql-symbol (package-name symbol-name)
-  "Find SYMBOL-NAME (a string) in PACKAGE-NAME (a string), or NIL if
-either the package or the symbol doesn't exist. See the note at the
-top of this section on why this indirection matters."
-  (let ((package (find-package package-name)))
-    (and package (find-symbol symbol-name package))))
-
-(defun ql-value (package-name symbol-name)
-  "SYMBOL-VALUE of PACKAGE-NAME:SYMBOL-NAME (both strings), or NIL if
-the package, symbol, or binding doesn't exist."
-  (let ((sym (ql-symbol package-name symbol-name)))
-    (and sym (boundp sym) (symbol-value sym))))
-
-(defun (setf ql-value) (new-value package-name symbol-name)
-  "Set PACKAGE-NAME:SYMBOL-NAME (both strings) to NEW-VALUE. Errors if
-the package or symbol doesn't exist -- unlike QL-VALUE's read side,
-there's no sensible NIL fallback for a set that silently didn't
-happen, so callers should confirm the target is expected to exist
-(e.g. by checking FIND-PACKAGE first) before setting through this."
-  (let ((sym (ql-symbol package-name symbol-name)))
-    (unless sym (error "~a:~a not found" package-name symbol-name))
-    (setf (symbol-value sym) new-value)))
-
-(defun ql-call (package-name symbol-name &rest args)
-  "Like (funcall (find-symbol ...) ...), resolved from strings. Errors
-if the package or symbol doesn't exist."
-  (let ((sym (ql-symbol package-name symbol-name)))
-    (unless sym (error "~a:~a not found" package-name symbol-name))
-    (apply sym args)))
 
 (defun run-and-check (program args output-file)
   "Best-effort: run PROGRAM with ARGS via SB-EXT:RUN-PROGRAM (searching
@@ -755,7 +771,7 @@ continuing without Quicklisp this session~%")
             (finish-output))
           (return-from install-quicklisp-if-needed nil))
         (load installer)
-        (let ((install-fn (ql-symbol "QUICKLISP-QUICKSTART" "INSTALL")))
+        (let ((install-fn (dynamic-symbol "QUICKLISP-QUICKSTART" "INSTALL")))
           (unless (and install-fn (fboundp install-fn))
             (with-output-lock
               (format t "~&;;; QUICKLISP: ~a loaded but did not define ~
@@ -803,15 +819,15 @@ single call (see standard-dist-enumeration-function in Quicklisp's own
 dist.lisp) rather than caching them in a global -- so plain quickloads
 of dist-hosted systems already follow *quicklisp-home* correctly with
 no help needed."
-  (setf (ql-value "QL-SETUP" "*QUICKLISP-HOME*") target-home)
-  (setf (ql-value "QL" "*LOCAL-PROJECT-DIRECTORIES*")
-        (list (ql-call "QL-SETUP" "QMERGE" "local-projects/")))
+  (setf (dynamic-value "QL-SETUP" "*QUICKLISP-HOME*") target-home)
+  (setf (dynamic-value "QL" "*LOCAL-PROJECT-DIRECTORIES*")
+        (list (dynamic-call "QL-SETUP" "QMERGE" "local-projects/")))
   ;; Re-running QL:SETUP is cheap and has two genuinely useful side
   ;; effects beyond what's fixed above: it creates local-projects/ at
   ;; the new home if missing, and re-runs any local-init/*.lisp files
   ;; found there -- relevant if the two environments have different
   ;; local customizations.
-  (ql-call "QL" "SETUP"))
+  (dynamic-call "QL" "SETUP"))
 
 (defun ensure-quicklisp-configured (bridge-dir)
   "If QUICKLISP_HOME is set in the environment, make a best-effort
@@ -839,7 +855,7 @@ continuing without it this session~%" target-home)
           ;; effect of installing, or (the resume case) already loaded
           ;; before this image was suspended. Either way, just make
           ;; sure it's pointed at the right place; never reload it.
-          (let ((current-home (ql-value "QL-SETUP" "*QUICKLISP-HOME*")))
+          (let ((current-home (dynamic-value "QL-SETUP" "*QUICKLISP-HOME*")))
             (unless (paths-equal-p current-home target-home)
               (with-output-lock
                 (format t "~&;;; QUICKLISP: QUICKLISP_HOME changed: ~a -> ~a~%"
@@ -858,6 +874,221 @@ continuing without it this session~%" target-home)
                 (format t "~&;;; QUICKLISP: loading ~a failed: ~a; continuing without ~
 Quicklisp this session~%" setup-lisp-path c)
                 (finish-output))))))))
+
+;;; ---------------------------------------------------------------------
+;;; ASDF cache relocation
+;;;
+;;; If XDG_CACHE_HOME is set in the environment and ASDF is already
+;;; loaded in this image (whether via Quicklisp, or standalone via a
+;;; plain (require :asdf)), make sure ASDF's compiled-fasl output
+;;; cache is pointed at the CURRENT XDG_CACHE_HOME rather than
+;;; whatever was baked in when it was first computed.
+;;;
+;;; This is the same class of problem as the Quicklisp-home sync
+;;; above, found by investigating it the same way: reading ASDF/UIOP's
+;;; actual source (github.com/fare/asdf, version 3.3.6.2, matching
+;;; what SBCL bundles) rather than assuming. UIOP's uiop/configuration
+;;; computes a special variable, uiop:*user-cache*, via
+;;; (xdg-cache-home "common-lisp" :implementation) -- reading
+;;; XDG_CACHE_HOME fresh -- but only does so ONCE, either when
+;;; uiop/configuration is first loaded, or (in UIOP's own dump/restore
+;;; workflow) via a registered image-restore-hook. That second
+;;; mechanism is exactly where this breaks down for us:
+;;; uiop:restore-image, the function that would re-invoke the hook and
+;;; refresh *user-cache* on a resume, is something a program has to
+;;; call explicitly from its OWN :toplevel if it wants that behavior --
+;;; and RESUME-BRIDGE doesn't; it's a plain custom :toplevel calling
+;;; RUN-BRIDGE directly, with no dependency on UIOP's dump/restore
+;;; machinery at all. So *user-cache* just sits there, stale, exactly
+;;; like ql:*local-project-directories* did.
+;;;
+;;; Worse than the Quicklisp case, in one respect: even fixing
+;;; *user-cache* alone is not enough, and this was verified directly
+;;; rather than assumed, the same way the Quicklisp-home fix was.
+;;; ASDF's asdf/output-translations maintains its OWN cache,
+;;; asdf:*output-translations* (backed by the (asdf:output-translations)
+;;; accessor), computed from *user-cache* the first time
+;;; asdf:ensure-output-translations runs -- which happens automatically
+;;; inside asdf:find-system, i.e. the first time anything is quickloaded
+;;; or asdf:load-system'd. That computation happens ONCE and is cached
+;;; from then on; changing *user-cache* afterward, alone, has no effect
+;;; on it. Confirmed by direct testing: computing output-translations
+;;; under one XDG_CACHE_HOME, then changing XDG_CACHE_HOME and
+;;; recomputing *user-cache* alone, still translated a test source path
+;;; into the OLD cache directory -- only additionally calling
+;;; asdf:initialize-output-translations actually re-derives the real,
+;;; in-use translation table from the refreshed *user-cache*.
+;;;
+;;; As with Quicklisp, everything here is resolved via DYNAMIC-SYMBOL/
+;;; DYNAMIC-VALUE/DYNAMIC-CALL rather than literal asdf:/uiop: symbols,
+;;; for the same reader-error reason (ASDF is not auto-loaded by SBCL;
+;;; plenty of systems never (require :asdf) at all). The two symbols
+;;; this relies on -- uiop:xdg-cache-home and uiop:*user-cache* -- were
+;;; confirmed EXTERNAL in the UIOP package directly (not just some
+;;; internal uiop/configuration implementation package), and
+;;; asdf:initialize-output-translations is EXTERNAL in ASDF, so this
+;;; sticks to stable, public API rather than reaching into ASDF's
+;;; internal package structure.
+;;;
+;;; What this deliberately does NOT touch: ASDF's *source-registry*
+;;; (where ASDF looks to FIND systems, as opposed to where it puts
+;;; compiled output) has an analogous once-computed cache, but it's
+;;; driven by CL_SOURCE_REGISTRY and standard XDG config/data
+;;; directories, not XDG_CACHE_HOME -- and Quicklisp-managed systems
+;;; bypass it entirely via the search-functions mechanism SYNC-
+;;; QUICKLISP-HOME already re-registers (see ql:setup, called there).
+;;; Checked directly against the source; not applicable to the
+;;; QUICKLISP_HOME/XDG_CACHE_HOME relocation this bridge cares about.
+
+(defun ensure-asdf-cache-configured ()
+  "If XDG_CACHE_HOME is set in the environment and ASDF/UIOP is
+already loaded in this image, make sure ASDF's compiled-fasl output
+cache is pointed at the CURRENT XDG_CACHE_HOME. Does nothing if
+XDG_CACHE_HOME is unset, or if ASDF/UIOP hasn't been loaded in this
+image at all -- in the latter case there's nothing to fix: whenever
+ASDF/UIOP DOES get loaded (e.g. as a side effect of
+ENSURE-QUICKLISP-CONFIGURED, or a request's own (require :asdf)), its
+cache computes correctly from the then-current environment with no
+help needed. Only a RESUME where ASDF was already loaded before
+suspend, with XDG_CACHE_HOME now different, needs this."
+  (let ((env-cache (sb-ext:posix-getenv "XDG_CACHE_HOME")))
+    (unless (and env-cache (plusp (length env-cache)))
+      (return-from ensure-asdf-cache-configured))
+    (unless (find-package "UIOP")
+      (return-from ensure-asdf-cache-configured))
+    (let ((current (dynamic-value "UIOP" "*USER-CACHE*"))
+          (fresh (dynamic-call "UIOP" "XDG-CACHE-HOME" "common-lisp" :implementation)))
+      ;; Deliberately EQUAL, not PATHS-EQUAL-P: unlike SBCL_HOME/
+      ;; QUICKLISP_HOME, the ASDF cache directory routinely doesn't
+      ;; exist on disk yet (ASDF creates it lazily, the first time it
+      ;; actually writes a fasl there, not when merely computing this
+      ;; path) -- TRUENAME-based comparison would fail to resolve BOTH
+      ;; sides in that common case and spuriously report "different"
+      ;; even when they're identical. CURRENT and FRESH are both
+      ;; produced by the same UIOP:XDG-CACHE-HOME call (confirmed to
+      ;; return consistent, already-normalized pathnames across calls
+      ;; with the same input), so plain pathname EQUAL is the correct,
+      ;; existence-independent comparison here.
+      (unless (equal current fresh)
+        (with-output-lock
+          (format t "~&;;; ASDF: XDG_CACHE_HOME changed: ~a -> ~a~%" current fresh)
+          (finish-output))
+        (setf (dynamic-value "UIOP" "*USER-CACHE*") fresh)
+        ;; Re-derive the actual in-use translation table from the
+        ;; refreshed *user-cache* -- see the section comment above for
+        ;; why setting *user-cache* alone is not sufficient. Called
+        ;; with no argument, which per ASDF's own default reuses
+        ;; whatever *output-translations-parameter* was already in
+        ;; effect (typically NIL, meaning "the standard
+        ;; enable-user-cache configuration"), so any customization the
+        ;; caller made is preserved -- only the stale cache location
+        ;; is corrected.
+        (when (find-package "ASDF")
+          (dynamic-call "ASDF" "INITIALIZE-OUTPUT-TRANSLATIONS"))))))
+
+;;; ---------------------------------------------------------------------
+;;; CL_SOURCE_REGISTRY relocation
+;;;
+;;; If CL_SOURCE_REGISTRY is set in the environment and ASDF is already
+;;; loaded in this image, make sure ASDF's source-registry -- where it
+;;; looks to FIND systems, as opposed to ENSURE-ASDF-CACHE-CONFIGURED's
+;;; concern of where it puts compiled output -- reflects the CURRENT
+;;; CL_SOURCE_REGISTRY rather than whatever was baked in when it was
+;;; first computed.
+;;;
+;;; This is opt-in via CL_SOURCE_REGISTRY specifically, deliberately
+;;; independent of QUICKLISP_HOME/XDG_CACHE_HOME: plenty of setups use
+;;; CL_SOURCE_REGISTRY to point at project-local systems with no
+;;; Quicklisp involvement at all, and even where Quicklisp is in use,
+;;; CL_SOURCE_REGISTRY is a separate mechanism serving a separate
+;;; purpose (a hand-picked list of additional source locations, not
+;;; where Quicklisp's own dist-managed systems live). Unlike the other
+;;; two relocations, this one exists specifically to make it safe and
+;;; natural for a coding agent to rely on CL_SOURCE_REGISTRY for its
+;;; own project systems -- worth doing even though the same shared-
+;;; workspace stress-testing that found the first two bugs wouldn't
+;;; itself depend on it.
+;;;
+;;; Same class of problem as SYNC-QUICKLISP-HOME and ENSURE-ASDF-CACHE-
+;;; CONFIGURED, and investigated the same way: reading ASDF's actual
+;;; source rather than assuming. ASDF's asdf/source-registry computes a
+;;; special variable, asdf:*source-registry* -- a hash table mapping
+;;; system names to .asd pathnames -- the first time anything calls
+;;; asdf:find-system, via asdf:ensure-source-registry. That computation
+;;; happens once; ENSURE-SOURCE-REGISTRY is explicitly documented, in
+;;; ASDF's own source comments, as a no-op once *source-registry* is
+;;; already a hash table, regardless of whether CL_SOURCE_REGISTRY has
+;;; changed since. UIOP's own mechanism for resetting this before a
+;;; save -- CLEAR-CONFIGURATION, which CLEAR-SOURCE-REGISTRY is
+;;; registered against -- is wired to an image-DUMP hook
+;;; (UIOP:DUMP-IMAGE's, specifically), which RESUME-BRIDGE's plain
+;;; SB-EXT:SAVE-LISP-AND-DIE call never goes through, so it never fires
+;;; for us -- the same reason the analogous image-RESTORE hook never
+;;; fires for uiop:*user-cache* in ENSURE-ASDF-CACHE-CONFIGURED above.
+;;; Confirmed directly, the same way that was: built two real, separate
+;;; directories each with their own .asd system, pointed
+;;; CL_SOURCE_REGISTRY at one, loaded it, then changed
+;;; CL_SOURCE_REGISTRY to the other and called ENSURE-SOURCE-REGISTRY
+;;; again alone -- the system that only existed in the new location was
+;;; still not found. Only an explicit CLEAR-SOURCE-REGISTRY followed by
+;;; INITIALIZE-SOURCE-REGISTRY picked it up.
+;;;
+;;; Unlike the QUICKLISP_HOME/XDG_CACHE_HOME comparisons, there's no
+;;; single ASDF-owned variable holding "the CL_SOURCE_REGISTRY
+;;; currently in effect" to compare against -- *source-registry* is the
+;;; computed hash-table RESULT, not the input, and comparing two hash
+;;; tables for content-equality is a different (and less useful)
+;;; question than comparing two configuration strings. So this bridge
+;;; keeps its own record, *SYNCED-CL-SOURCE-REGISTRY*, of the raw
+;;; environment string last synced against -- preserved across
+;;; suspend/resume like everything else baked into the image, which is
+;;; exactly what lets a resume detect a change against it.
+
+(defvar *synced-cl-source-registry* nil
+  "The raw CL_SOURCE_REGISTRY environment string ASDF's source
+registry was last synced against in this image, or NIL if it's never
+been synced at all. See ENSURE-CL-SOURCE-REGISTRY-CONFIGURED.")
+
+(defun ensure-cl-source-registry-configured ()
+  "If CL_SOURCE_REGISTRY is set in the environment and ASDF is already
+loaded in this image, make sure ASDF's source-registry reflects it.
+Does nothing if CL_SOURCE_REGISTRY is unset. Otherwise always records the
+current value in *SYNCED-CL-SOURCE-REGISTRY* as this call's baseline --
+deliberately NOT gated on ASDF being loaded yet, which matters more here
+than it might look: this function only runs once per run-bridge start
+or resume, almost always BEFORE a user's own request has gotten around
+to loading ASDF at all. If baseline-recording waited for ASDF to
+already be loaded, the very first opportunity to record one would
+almost always be missed entirely (ASDF isn't loaded yet at bridge
+startup), leaving *SYNCED-CL-SOURCE-REGISTRY* NIL for the whole
+pre-suspend session even though a request loads ASDF and correctly
+computes its source-registry from this same, unchanged value moments
+later -- and then a subsequent resume with CL_SOURCE_REGISTRY
+UNCHANGED would spuriously compare a real string against that NIL
+baseline and report a false \"changed\" every single time. Confirmed
+this exact false positive directly before fixing it: recorded 0
+Quicklisp/ASDF: log lines expected across an unchanged resume, got 1.
+
+The actual fix -- CLEAR-SOURCE-REGISTRY plus INITIALIZE-SOURCE-REGISTRY
+-- only runs when ALL of: a prior baseline was already recorded (not
+this call's first-ever look), that baseline disagrees with the current
+environment, ASDF is loaded, and its source-registry has actually been
+computed (SOURCE-REGISTRY-INITIALIZED-P) -- i.e. exactly a resume where
+something computed earlier could plausibly be stale."
+  (let ((env-registry (sb-ext:posix-getenv "CL_SOURCE_REGISTRY")))
+    (unless (and env-registry (plusp (length env-registry)))
+      (return-from ensure-cl-source-registry-configured))
+    (when (and *synced-cl-source-registry*
+               (not (equal env-registry *synced-cl-source-registry*))
+               (find-package "ASDF")
+               (dynamic-call "ASDF" "SOURCE-REGISTRY-INITIALIZED-P"))
+      (with-output-lock
+        (format t "~&;;; ASDF: CL_SOURCE_REGISTRY changed: ~a -> ~a~%"
+                *synced-cl-source-registry* env-registry)
+        (finish-output))
+      (dynamic-call "ASDF" "CLEAR-SOURCE-REGISTRY")
+      (dynamic-call "ASDF" "INITIALIZE-SOURCE-REGISTRY"))
+    (setf *synced-cl-source-registry* env-registry)))
 
 ;;; ---------------------------------------------------------------------
 ;;; Main loop
@@ -926,6 +1157,19 @@ Does not return under normal operation."
     ;; bridge from reaching its main loop and becoming usable for
     ;; ordinary (non-Quicklisp) requests.
     (ignore-errors (ensure-quicklisp-configured dir))
+    ;; Same treatment for the ASDF output-translations (fasl cache)
+    ;; relocation -- see "ASDF cache relocation" above. Deliberately
+    ;; called AFTER Quicklisp setup, not before: on a fresh install
+    ;; Quicklisp's own bootstrap is what loads ASDF/UIOP into the image
+    ;; in the first place, so calling this first would almost always
+    ;; find no ASDF/UIOP present yet and have nothing to do.
+    (ignore-errors (ensure-asdf-cache-configured))
+    ;; Same treatment again for CL_SOURCE_REGISTRY -- see
+    ;; "CL_SOURCE_REGISTRY relocation" above. Order relative to the
+    ;; other two doesn't matter here (all three check independently
+    ;; whether ASDF/Quicklisp are already loaded and no-op if not), but
+    ;; keeping it grouped with the ASDF-cache call for readability.
+    (ignore-errors (ensure-cl-source-registry-configured))
     (loop
       (block iteration
         (handler-bind
