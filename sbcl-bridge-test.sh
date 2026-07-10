@@ -50,15 +50,35 @@ set -u
 # directory ended up with leftover fasls compiled under a throwaway
 # "never-installed" test path, because this suite was run in a shell
 # that had XDG_CACHE_HOME set for real work, and nothing here ever
-# isolated it. Unsetting these five here means every test EXCEPT the
-# ones that explicitly reintroduce one of them via its own `env
-# VAR=... ctl.sh ...` invocation (see the Quicklisp, ASDF cache, and
+# isolated it. Unsetting these here means every test EXCEPT the ones
+# that explicitly reintroduce one of them via its own `env VAR=...
+# ctl.sh ...` invocation (see the Quicklisp, ASDF cache, and
 # CL_SOURCE_REGISTRY sections below, each of which points these at
 # throwaway `mktemp -d` locations of its own) runs exactly as if none of
 # the three features existed at all -- which is the correct, isolated
 # default for a suite that has nothing to do with any of them for most
 # of its checks.
+#
+# SBCL_REQUEST_TIMEOUT / SBCL_TIMEOUT / SBCL_POLL_INTERVAL get the same
+# treatment for the identical reason, found the same way -- a real run
+# on a real machine, not a hypothetical: sbcl-client.sh gives an
+# ambient SBCL_REQUEST_TIMEOUT precedence over an embedded ";;;
+# TIMEOUT:" header (documented, correct behavior -- see §7 of the
+# README), so a user who keeps SBCL_REQUEST_TIMEOUT set for their own
+# real work (a generous default for long-running requests, say) would
+# have that value silently override any test here that assumes an
+# embedded header alone controls the bridge-side timeout. That's
+# exactly what happened: an ambient SBCL_REQUEST_TIMEOUT=60 made a test
+# expecting a 1-second embedded timeout to fire instead complete
+# normally under the ambient 60-second budget, status=ok instead of
+# status=timeout, exit 0 instead of exit 3. Every OTHER test that
+# cares about either variable already sets its own value explicitly
+# (grep for SBCL_REQUEST_TIMEOUT= / SBCL_TIMEOUT= below), which
+# naturally overrides whatever's ambient regardless -- this global
+# unset is what makes that the reliable default rather than an
+# accident of which tests happened to remember.
 unset QUICKLISP_HOME QUICKLISP_LISP QUICKLISP_INSTALLER_URL XDG_CACHE_HOME CL_SOURCE_REGISTRY
+unset SBCL_REQUEST_TIMEOUT SBCL_TIMEOUT SBCL_POLL_INTERVAL
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CTL="$SCRIPT_DIR/sbcl-bridge-ctl.sh"
