@@ -30,6 +30,8 @@ the system. It covers five files:
     was invoked from (see §3.1); handing that file over is usually enough to
     debug a failure on a machine nobody else can log into.
 
+See [`CHANGELOG.md`](CHANGELOG.md) for the dated history of what's changed.
+
 > **Provenance and AI Disclosure**
 >
 > This project was synthesized through close collaboration between an
@@ -1879,6 +1881,7 @@ export CL_SOURCE_REGISTRY=/path/to/systems//    # optional; see §8.9
 # Logs (sbcl-output.log, sbcl-input.log, sbcl-async-errors.log -- the third
 # records unhandled conditions from threads OTHER than the bridge's own main
 # one, e.g. one a web server you started spawned; see §9)
+
 ./sbcl-bridge-ctl.sh logs [-f] [lines]
 ./sbcl-bridge-ctl.sh rotate-logs [--force]
 
