@@ -6,11 +6,15 @@
 #
 # Usage:
 #   sbcl-bridge-ctl.sh start
-#   sbcl-bridge-ctl.sh stop
-#   sbcl-bridge-ctl.sh restart
+#   sbcl-bridge-ctl.sh stop        [--force]   # graceful (cancel, then in-Lisp
+#                                              # exit) unless --force skips to signals
+#   sbcl-bridge-ctl.sh restart                 # stop + FRESH start (no saved state)
+#   sbcl-bridge-ctl.sh refresh                 # stop + resume from cores/current.core
 #   sbcl-bridge-ctl.sh status
-#   sbcl-bridge-ctl.sh suspend     [core-path]
-#   sbcl-bridge-ctl.sh resume      [core-path]
+#   sbcl-bridge-ctl.sh suspend     [core-path] [--name NAME]  # --name pins it
+#   sbcl-bridge-ctl.sh resume      [core-path-or-name]
+#   sbcl-bridge-ctl.sh delete-core <name-or-path> [--force]   # only way to
+#                                                              # remove a pinned core
 #   sbcl-bridge-ctl.sh interrupt   [reqid]     # cancel the request in flight
 #   sbcl-bridge-ctl.sh logs        [-f] [n]    # tail the output log
 #   sbcl-bridge-ctl.sh rotate-logs [--force]   # also checked automatically by status
@@ -21,10 +25,12 @@
 #   SBCL_BRIDGE_DIR       directory the bridge monitors (default: .)
 #   SBCL_BRIDGE_LISP      path to sbcl-bridge.lisp (default: alongside this script)
 #   SBCL_BIN              sbcl executable (default: sbcl)
-#   SBCL_CORE_RETAIN      number of core images to keep (default: 3)
+#   SBCL_CORE_RETAIN      number of unpinned, non-current core images to keep
+#                         (default: 3) -- see `usage` (below) for why actual
+#                         disk usage is this many PLUS the current one
 #   SBCL_PROCESSED_RETAIN number of archived request files to keep in
 #                         processed/ (default: 200; pruned on status)
-#   SBCL_STOP_TIMEOUT     seconds to wait before SIGKILL on stop (default: 10)
+#   SBCL_STOP_TIMEOUT     seconds to wait per stop escalation phase (default: 10)
 #   SBCL_SUSPEND_TIMEOUT  seconds to wait for suspend to finish (default: 60)
 
 set -euo pipefail
@@ -63,6 +69,11 @@ BRIDGE_DIR="$(cd "$BRIDGE_DIR" && pwd)"
 PID_FILE="$BRIDGE_DIR/.sbcl-bridge.pid"
 OUTPUT_LOG="$BRIDGE_DIR/sbcl-output.log"
 INPUT_LOG="$BRIDGE_DIR/sbcl-input.log"
+ASYNC_ERROR_LOG="$BRIDGE_DIR/sbcl-async-errors.log"
+# Every log rotation/pruning call site loops this array rather than
+# naming OUTPUT_LOG/INPUT_LOG/ASYNC_ERROR_LOG individually, so a future
+# fourth log only needs to be added here once.
+BRIDGE_LOGS=("$OUTPUT_LOG" "$INPUT_LOG" "$ASYNC_ERROR_LOG")
 CORE_DIR="$BRIDGE_DIR/cores"
 CORE_RETAIN="${SBCL_CORE_RETAIN:-3}"
 PROCESSED_DIR="$BRIDGE_DIR/processed"
@@ -125,6 +136,48 @@ is_running() {
   return 0
 }
 
+scan_stray_bridges() {
+  # Best-effort scan for OTHER live processes that both (a) claim, via
+  # their own environment, to be watching this same BRIDGE_DIR, AND (b)
+  # look like an sbcl-bridge process by cmdline (mirroring IS_RUNNING's
+  # own heuristic) -- an on-demand diagnostic alongside sbcl-bridge.lisp's
+  # own startup-time refusal (see CLAIM-PID-FILE), which only guards the
+  # moment a bridge starts. This additionally catches strays left over
+  # from before that hardening existed, or started by some means other
+  # than this script. Purely diagnostic: never kills or touches anything.
+  #
+  # Both conditions matter: environment variables are inherited across
+  # exec/fork, so SBCL_BRIDGE_DIR alone is NOT a reliable signal on its
+  # own -- e.g. this very script re-exports it into its own process
+  # before backgrounding the bridge, so a bash helper process (this
+  # script, one of its own command substitutions, etc.) that happens to
+  # be alive at scan time would otherwise be flagged as a "stray bridge"
+  # despite not being sbcl at all. Confirmed directly: an earlier version
+  # of this check, without the cmdline filter, did exactly that -- and
+  # even the cmdline filter alone isn't quite enough: when this script is
+  # invoked directly by its own path (rather than as `bash script.sh`),
+  # argv[0] IS that path, and "sbcl-bridge-ctl.sh" itself contains the
+  # substring "sbcl", so this script's OWN process can satisfy the
+  # cmdline check too -- confirmed directly, the same way. Excluding our
+  # own PID ($$, not just the bridge's recorded PID) is what actually
+  # closes that.
+  [ -d /proc ] || return 0
+  local self_pid pid envfile
+  self_pid="$(current_pid)"
+  for envfile in /proc/[0-9]*/environ; do
+    [ -r "$envfile" ] || continue
+    pid="$(basename "$(dirname "$envfile")")"
+    [ "$pid" = "$$" ] && continue
+    [ -n "$self_pid" ] && [ "$pid" = "$self_pid" ] && continue
+    [ -r "/proc/$pid/cmdline" ] || continue
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qE 'sbcl|\.core' || continue
+    if tr '\0' '\n' < "$envfile" 2>/dev/null | grep -qxF "SBCL_BRIDGE_DIR=$BRIDGE_DIR"; then
+      echo "WARNING: pid $pid also has SBCL_BRIDGE_DIR=$BRIDGE_DIR -- possible duplicate bridge watching this directory." >&2
+    fi
+  done
+  return 0
+}
+
 wait_for_exit() {
   # wait_for_exit PID TIMEOUT -- returns 0 if the process exits in time
   local pid="$1" timeout="$2" waited=0
@@ -138,9 +191,39 @@ wait_for_exit() {
   return 0
 }
 
+wait_for_start() {
+  # wait_for_start TIMEOUT -- polls until IS_RUNNING becomes true, i.e.
+  # the just-spawned process has itself written an authoritative PID
+  # file (via sbcl-bridge.lisp's CLAIM-PID-FILE) and passed the
+  # liveness/identity check -- or TIMEOUT seconds have passed. Returns
+  # 0/1 accordingly. Deliberately does NOT trust $! as a placeholder PID
+  # in the meantime; see the comment at its call site in cmd_start for
+  # why.
+  local timeout="$1" waited=0
+  while ! is_running; do
+    if awk -v w="$waited" -v t="$timeout" 'BEGIN{exit !(w>=t)}'; then
+      return 1
+    fi
+    sleep "$POLL_INTERVAL"
+    waited=$(awk -v w="$waited" -v p="$POLL_INTERVAL" 'BEGIN{printf "%.2f", w+p}')
+  done
+  return 0
+}
+
 list_cores_by_age() {
-  # newest first, one per line; empty output if none (nullglob is set)
-  local files=("$CORE_DIR"/*.core)
+  # newest first, one per line; empty output if none (nullglob is set).
+  # Excludes current.core itself: that's a pointer TO one of these
+  # files (see UPDATE_CURRENT_CORE_SYMLINK/cmd_refresh), not a core
+  # image of its own. Letting it into this glob would corrupt
+  # newest-by-mtime ordering -- a symlink's own mtime updates every
+  # time it's re-pointed, unrelated to the age of the core it actually
+  # points at -- and would let prune_cores try to count or delete it
+  # as if it were a real image.
+  local files=() f
+  for f in "$CORE_DIR"/*.core; do
+    [ "$(basename "$f")" = "current.core" ] && continue
+    files+=("$f")
+  done
   [ ${#files[@]} -eq 0 ] && return 0
   ls -t "${files[@]}"
 }
@@ -149,20 +232,100 @@ latest_core() {
   list_cores_by_age | head -n1
 }
 
+resolve_core_arg() {
+  # resolve_core_arg <name-or-path> -- tries, in order: the literal
+  # argument as a path, "<name>.core" under cores/ (the default naming
+  # a `suspend --name` produces), then the bare argument itself under
+  # cores/ (in case a caller already wrote the .core suffix). Lets
+  # resume/delete-core accept either a full path (as before) or a bare
+  # pinned-core name. Prints nothing (not an error) if none resolve --
+  # callers already have their own "no core found" messaging.
+  local arg="$1"
+  if [ -f "$arg" ]; then
+    printf '%s' "$arg"
+  elif [ -f "$CORE_DIR/$arg.core" ]; then
+    printf '%s' "$CORE_DIR/$arg.core"
+  elif [ -f "$CORE_DIR/$arg" ]; then
+    printf '%s' "$CORE_DIR/$arg"
+  fi
+  # Always return 0: under `set -e`, letting the function's exit status
+  # track a failed final `elif` test would abort the whole script (via
+  # `core_path="$(resolve_core_arg ...)"`) for every ordinary "nothing
+  # matched" case -- the same class of bug fixed in core_pinned_name,
+  # above.
+  return 0
+}
+
+core_pinned_name() {
+  # core_pinned_name <core-path> -- prints the pinned name if <core-path>
+  # has a co-located .pinned sidecar, nothing otherwise. Always returns
+  # 0 -- under `set -e`, a bare `[ -f "$marker" ] && cat ...` as the
+  # last statement would make the function's own exit status track the
+  # test's, aborting the whole script (via `name="$(core_pinned_name
+  # ...)"`) for every ordinary, correctly-unpinned core. Confirmed
+  # directly: this exact bug truncated `status`'s core listing.
+  local marker="$1.pinned"
+  if [ -f "$marker" ]; then
+    cat "$marker"
+  fi
+  return 0
+}
+
+core_exempt_from_pruning() {
+  # core_exempt_from_pruning <core-path> -- T (via exit status) if
+  # <core-path> should survive SBCL_CORE_RETAIN's automatic pruning:
+  # either it's explicitly pinned (has a .pinned sidecar), or it's what
+  # cores/current.core currently resolves to. The second exemption is
+  # required for cmd_refresh's own correctness -- without it, `refresh`
+  # could end up pointing at a core prune_cores already deleted, e.g.
+  # after resuming a deliberately-old, unpinned core that then falls
+  # out of the retain window on the next suspend.
+  local core_path="$1"
+  [ -f "${core_path}.pinned" ] && return 0
+  if [ -L "$CORE_DIR/current.core" ]; then
+    local current
+    current="$(readlink -f "$CORE_DIR/current.core" 2>/dev/null || true)"
+    [ -n "$current" ] && [ "$current" = "$(readlink -f "$core_path" 2>/dev/null || echo "$core_path")" ] && return 0
+  fi
+  return 1
+}
+
+update_current_core_symlink() {
+  # update_current_core_symlink <core-path> -- points cores/current.core
+  # at CORE-PATH (relative symlink, so it survives the whole bridge
+  # directory being moved -- same philosophy as the SBCL_BRIDGE_DIR
+  # override elsewhere in this script). Called from cmd_suspend (with
+  # the just-saved core) and cmd_resume (with whichever core was
+  # actually resumed) -- together, these two call sites are what let
+  # cmd_refresh return to "the core that was actually live" rather
+  # than just "the newest file on disk," which can differ if someone
+  # deliberately resumed an older core.
+  ln -sfn "$(basename "$1")" "$CORE_DIR/current.core"
+}
+
 prune_cores() {
-  # Keep the CORE_RETAIN most recent core images; always keep at least
-  # one image even if CORE_RETAIN was set to 0 by mistake.
+  # Keep the CORE_RETAIN most recent NON-EXEMPT core images; always
+  # keep at least one even if CORE_RETAIN was set to 0 by mistake.
+  # Pinned cores and whatever cores/current.core points at (see
+  # CORE_EXEMPT_FROM_PRUNING) are excluded from this budget entirely --
+  # they're never deleted regardless of age or count, and they don't
+  # consume a retention slot that would otherwise starve ordinary
+  # rotation (e.g. several pinned cores plus CORE_RETAIN=3 still keeps
+  # 3 ordinary ones, not zero).
   local keep=$CORE_RETAIN
   [ "$keep" -lt 1 ] && keep=1
-  local files=()
-  while IFS= read -r line; do
-    [ -n "$line" ] && files+=("$line")
+  local all=() prunable=() f
+  while IFS= read -r f; do
+    [ -n "$f" ] && all+=("$f")
   done < <(list_cores_by_age)
-  local n=${#files[@]}
+  for f in "${all[@]}"; do
+    core_exempt_from_pruning "$f" || prunable+=("$f")
+  done
+  local n=${#prunable[@]}
   if [ "$n" -gt "$keep" ]; then
     local i
     for ((i = keep; i < n; i++)); do
-      rm -f "${files[$i]}" "${files[$i]}.version"
+      rm -f "${prunable[$i]}" "${prunable[$i]}.version"
     done
   fi
   # Remove orphaned version sidecars: write-version-sidecar runs BEFORE
@@ -406,10 +569,11 @@ check_and_rotate_logs() {
   if bridge_busy; then
     return 0
   fi
-  rotate_one_log "$OUTPUT_LOG"
-  rotate_one_log "$INPUT_LOG"
-  prune_logs "$(basename "$OUTPUT_LOG")."
-  prune_logs "$(basename "$INPUT_LOG")."
+  local log
+  for log in "${BRIDGE_LOGS[@]}"; do
+    rotate_one_log "$log"
+    prune_logs "$(basename "$log")."
+  done
 }
 
 # ---------------------------------------------------------------------
@@ -448,20 +612,41 @@ cmd_start() {
       --load "$BRIDGE_LISP" \
       --eval "(sbcl-bridge:run-bridge :directory $(lisp_string "$BRIDGE_DIR/"))" \
       < /dev/null >> "$OUTPUT_LOG" 2>&1 &
-  local pid=$!
-  disown "$pid" 2>/dev/null || true
-  echo "$pid" > "$PID_FILE"
-  sleep 0.5
-  if is_running; then
-    echo "Started (pid $pid)."
+  disown "$!" 2>/dev/null || true
+  # Deliberately NOT writing $! into PID_FILE as a placeholder here, the
+  # way earlier versions of this script did: `setsid CMD` can silently
+  # refork rather than exec CMD in place (see the extensive comment on
+  # this in sbcl-bridge.lisp's run-bridge, above its own
+  # SB-UNIX:UNIX-GETPID call), meaning $! sometimes names a short-lived
+  # wrapper process rather than the actual bridge -- and now that
+  # RUN-BRIDGE's own CLAIM-PID-FILE is the sole, authoritative writer of
+  # this file (see sbcl-bridge.lisp), a placeholder written here first
+  # would race against it: CLAIM-PID-FILE would find that placeholder
+  # already present, and -- since the exporting shell put the same
+  # SBCL_BRIDGE_DIR in the wrapper's environment too -- could even
+  # mistake it for a second, conflicting bridge and refuse to start at
+  # all. Instead, just wait for the bridge to claim the file for itself,
+  # the same way sbcl-client.lisp's BRIDGE-START already does.
+  if wait_for_start 5; then
+    echo "Started (pid $(current_pid))."
   else
     echo "Failed to start; check $OUTPUT_LOG" >&2
-    rm -f "$PID_FILE"
     exit 1
   fi
 }
 
+drop_stop_request() {
+  # Same file-drop idiom cmd_interrupt uses for cancel-request: a
+  # mktemp-then-atomic-rename so a concurrent reader never sees a
+  # partially-written file.
+  local tmp
+  tmp="$(mktemp "$BRIDGE_DIR/.stop-request.XXXXXX")"
+  : > "$tmp"
+  mv -f "$tmp" "$BRIDGE_DIR/stop-request"
+}
+
 cmd_stop() {
+  local force="${1:-}"
   if ! is_running; then
     echo "Not running."
     rm -f "$PID_FILE"
@@ -469,7 +654,48 @@ cmd_stop() {
   fi
   local pid
   pid="$(current_pid)"
-  echo "Stopping pid $pid ..."
+
+  if [ "$force" = "--force" ]; then
+    # Escape hatch: skip straight past the graceful file-drop mechanism
+    # entirely. Needed because sb-thread:interrupt-thread delivery
+    # requires the target thread to reach a safepoint -- tight,
+    # non-consing native code (or code running without-interrupts) on
+    # the main thread can stall delivery indefinitely, in which case the
+    # graceful phases below would just eat into the timeout budget
+    # before falling back to this same signal-based path anyway.
+    echo "Stopping pid $pid (--force: skipping graceful shutdown) ..."
+  else
+    echo "Stopping pid $pid ..."
+    # Phase 1: if a request is in flight, ask it to cancel first and
+    # give its own client a moment to observe status=cancelled before
+    # the process disappears out from under it. Reuses the exact same
+    # cancel-request mechanism `interrupt` already uses -- no separate,
+    # independent way to reach into a running eval.
+    if bridge_busy; then
+      cmd_interrupt "" || true
+      local cancel_wait
+      cancel_wait=$(awk -v t="$STOP_TIMEOUT" 'BEGIN{print (t<5)?t:5}')
+      local waited=0
+      while bridge_busy; do
+        sleep "$POLL_INTERVAL"
+        waited=$(awk -v w="$waited" -v p="$POLL_INTERVAL" 'BEGIN{printf "%.2f", w+p}')
+        awk -v w="$waited" -v t="$cancel_wait" 'BEGIN{exit !(w>=t)}' && break
+      done
+    fi
+    # Phase 2: graceful in-Lisp exit, whether the bridge just went idle
+    # above or was already idle to begin with -- the watchdog checks
+    # stop-request unconditionally, unlike cancel-request.
+    drop_stop_request
+    if wait_for_exit "$pid" "$STOP_TIMEOUT"; then
+      echo "Stopped."
+      rm -f "$PID_FILE" "$BRIDGE_DIR/stop-request"
+      return 0
+    fi
+    echo "Did not exit gracefully within ${STOP_TIMEOUT}s; sending SIGTERM."
+  fi
+
+  # Phase 3 (or, with --force, the only phase): signal-based, as before
+  # this escalation existed.
   kill -TERM "$pid" 2>/dev/null || true
   if wait_for_exit "$pid" "$STOP_TIMEOUT"; then
     echo "Stopped."
@@ -478,7 +704,7 @@ cmd_stop() {
     kill -KILL "$pid" 2>/dev/null || true
     wait_for_exit "$pid" 5 || true
   fi
-  rm -f "$PID_FILE"
+  rm -f "$PID_FILE" "$BRIDGE_DIR/stop-request"
 }
 
 cmd_restart() {
@@ -504,18 +730,50 @@ cmd_status() {
     [ -f "$PID_FILE" ] && rm -f "$PID_FILE"
   fi
 
-  local files=("$CORE_DIR"/*.core)
+  scan_stray_bridges
+
+  local files=()
+  while IFS= read -r line; do
+    [ -n "$line" ] && files+=("$line")
+  done < <(list_cores_by_age)
   if [ ${#files[@]} -gt 0 ]; then
     echo "Saved core images (newest first):"
-    ls -lt "${files[@]}" | awk '{printf "  %8d bytes  %s %s %s  %s\n", $5, $6, $7, $8, $9}'
+    local f pname annotation pinned_count=0
+    for f in "${files[@]}"; do
+      annotation=""
+      pname="$(core_pinned_name "$f")"
+      if [ -n "$pname" ]; then
+        annotation="  [named: $pname]"
+        pinned_count=$((pinned_count + 1))
+      fi
+      ls -l "$f" | awk -v ann="$annotation" '{printf "  %8d bytes  %s %s %s  %s%s\n", $5, $6, $7, $8, $9, ann}'
+    done
+    if [ "$pinned_count" -gt 0 ]; then
+      echo "Named/pinned cores: $pinned_count (exempt from SBCL_CORE_RETAIN pruning; delete-core to remove)"
+    fi
   else
     echo "No saved core images."
   fi
+  if [ -L "$CORE_DIR/current.core" ]; then
+    echo "Current (last resumed/suspended): $(readlink "$CORE_DIR/current.core")"
+  fi
 
-  local log_size_out log_size_in
+  local log_size_out log_size_in log_size_async
   log_size_out=$([ -f "$OUTPUT_LOG" ] && wc -c < "$OUTPUT_LOG" || echo 0)
   log_size_in=$([ -f "$INPUT_LOG" ] && wc -c < "$INPUT_LOG" || echo 0)
-  echo "Logs: sbcl-output.log=$((log_size_out / 1024))KB sbcl-input.log=$((log_size_in / 1024))KB"
+  log_size_async=$([ -f "$ASYNC_ERROR_LOG" ] && wc -c < "$ASYNC_ERROR_LOG" || echo 0)
+  echo "Logs: sbcl-output.log=$((log_size_out / 1024))KB sbcl-input.log=$((log_size_in / 1024))KB sbcl-async-errors.log=$((log_size_async / 1024))KB"
+
+  # Computed BEFORE check_and_rotate_logs below, so this reflects what's
+  # actually accumulated since the last rotation, not a near-zero count
+  # right after this same call rotates it away.
+  if [ -f "$ASYNC_ERROR_LOG" ]; then
+    local n_async
+    n_async=$(grep -c '^;;; ASYNC-ERROR ' "$ASYNC_ERROR_LOG" 2>/dev/null || echo 0)
+    if [ "$n_async" -gt 0 ]; then
+      echo "WARNING: $n_async async error(s) recorded in sbcl-async-errors.log (background-thread faults, main bridge unaffected)." >&2
+    fi
+  fi
 
   local n_processed=0
   local pfiles=("$PROCESSED_DIR"/*.lisp)
@@ -535,13 +793,41 @@ cmd_suspend() {
     echo "Not running; nothing to suspend." >&2
     exit 1
   fi
+  local name="" core_path_arg=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)
+        name="${2:-}"
+        shift 2
+        ;;
+      *)
+        core_path_arg="$1"
+        shift
+        ;;
+    esac
+  done
+  if [ -n "$name" ]; then
+    case "$name" in
+      *[!a-zA-Z0-9_-]*)
+        echo "Invalid --name '$name': use only letters, digits, '-', '_'." >&2
+        exit 1
+        ;;
+    esac
+  fi
+
   local pid ts core_path reqid
   pid="$(current_pid)"
   ts="$(date +%Y%m%d-%H%M%S)"
-  core_path="${1:-$CORE_DIR/bridge-$ts.core}"
+  if [ -n "$core_path_arg" ]; then
+    core_path="$core_path_arg"
+  elif [ -n "$name" ]; then
+    core_path="$CORE_DIR/$name.core"
+  else
+    core_path="$CORE_DIR/bridge-$ts.core"
+  fi
   reqid="suspend-$ts-$$"
 
-  echo "Requesting suspend to $core_path ..."
+  echo "Requesting suspend to $core_path ...${name:+ (named: $name)}"
   local tmp
   tmp="$(mktemp "$BRIDGE_DIR/.next-sbcl-input.XXXXXX")"
   {
@@ -551,8 +837,13 @@ cmd_suspend() {
     # for this request and let SBCL_SUSPEND_TIMEOUT below be the only
     # limit.
     printf ';;; TIMEOUT: none\n'
-    printf '(sbcl-bridge:suspend-bridge :core-path %s)\n' \
-           "$(lisp_string "$core_path")"
+    if [ -n "$name" ]; then
+      printf '(sbcl-bridge:suspend-bridge :core-path %s :name %s)\n' \
+             "$(lisp_string "$core_path")" "$(lisp_string "$name")"
+    else
+      printf '(sbcl-bridge:suspend-bridge :core-path %s)\n' \
+             "$(lisp_string "$core_path")"
+    fi
   } > "$tmp"
   # Atomic claim of the input slot: ln fails if a request is already
   # queued, with no window between check and submission (the previous
@@ -569,6 +860,7 @@ cmd_suspend() {
       chmod +x "$core_path" 2>/dev/null || true
       echo "Suspended. Core image saved: $core_path"
       rm -f "$PID_FILE"
+      update_current_core_symlink "$core_path"
       prune_cores
     else
       echo "Process exited but core image is missing/empty: $core_path" >&2
@@ -599,7 +891,12 @@ cmd_resume() {
     echo "Already running (pid $(current_pid))."
     return 0
   fi
-  local core_path="${1:-$(latest_core)}"
+  local core_path
+  if [ -n "${1:-}" ]; then
+    core_path="$(resolve_core_arg "$1")"
+  else
+    core_path="$(latest_core)"
+  fi
   if [ -z "$core_path" ] || [ ! -f "$core_path" ]; then
     echo "No core image to resume from (looked in $CORE_DIR)." >&2
     exit 1
@@ -629,17 +926,75 @@ cmd_resume() {
   else
     setsid "$SBCL_BIN" --core "$core_path" < /dev/null >> "$OUTPUT_LOG" 2>&1 &
   fi
-  local pid=$!
-  disown "$pid" 2>/dev/null || true
-  echo "$pid" > "$PID_FILE"
-  sleep 0.5
-  if is_running; then
-    echo "Resumed (pid $pid)."
+  disown "$!" 2>/dev/null || true
+  # See the matching comment in cmd_start: deliberately not writing a
+  # placeholder PID file here either, for the identical setsid-refork /
+  # CLAIM-PID-FILE-race reason.
+  if wait_for_start 5; then
+    echo "Resumed (pid $(current_pid))."
+    update_current_core_symlink "$core_path"
   else
     echo "Failed to resume; check $OUTPUT_LOG" >&2
-    rm -f "$PID_FILE"
     exit 1
   fi
+}
+
+cmd_refresh() {
+  # stop + resume, but -- unlike restart, which is stop + FRESH start --
+  # remembering which core was actually live rather than just grabbing
+  # the newest file on disk by mtime (those can differ if someone
+  # deliberately resumed an older core; see UPDATE_CURRENT_CORE_SYMLINK).
+  local target=""
+  if [ -L "$CORE_DIR/current.core" ]; then
+    target="$(readlink -f "$CORE_DIR/current.core" 2>/dev/null || true)"
+  fi
+  if [ -z "$target" ] || [ ! -f "$target" ]; then
+    echo "Nothing to refresh: no current-core symlink (this bridge directory" >&2
+    echo "has only ever been freshly started, never suspended or resumed)." >&2
+    echo "Use 'start' for a fresh image, or 'resume [core-path]' explicitly." >&2
+    exit 1
+  fi
+  cmd_stop
+  cmd_resume "$target"
+}
+
+cmd_delete_core() {
+  # delete-core <name-or-path> [--force] -- the only way a pinned core
+  # is ever removed (prune_cores deliberately never touches one). Also
+  # works on unpinned/anonymous cores, by path or by their timestamp
+  # "name". Refuses, without --force, to delete whatever the running
+  # bridge (if any) was actually started from -- best-effort: compares
+  # against /proc/<pid>/cmdline, which names the core path directly for
+  # a resume via the executable core itself, or via `sbcl --core PATH`.
+  local arg="" force=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force="--force" ;;
+      *) arg="$1" ;;
+    esac
+    shift
+  done
+  if [ -z "$arg" ]; then
+    echo "Usage: $(basename "$0") delete-core <name-or-path> [--force]" >&2
+    exit 1
+  fi
+  local core_path
+  core_path="$(resolve_core_arg "$arg")"
+  if [ -z "$core_path" ] || [ ! -f "$core_path" ]; then
+    echo "No core found matching '$arg' (looked in $CORE_DIR)." >&2
+    exit 1
+  fi
+  if [ "$force" != "--force" ] && is_running; then
+    local pid; pid="$(current_pid)"
+    if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$core_path"; then
+      echo "Refusing to delete $core_path: the running bridge (pid $pid) appears to" >&2
+      echo "have been started from it. Stop the bridge first, or pass --force." >&2
+      exit 1
+    fi
+  fi
+  local name; name="$(core_pinned_name "$core_path")"
+  rm -f "$core_path" "${core_path}.version" "${core_path}.pinned"
+  echo "Deleted $core_path${name:+ (was named: $name)}."
 }
 
 cmd_interrupt() {
@@ -693,10 +1048,11 @@ cmd_rotate_logs() {
       echo "WARNING: a request is queued or in flight; forcing rotation anyway." >&2
       echo "         A client currently waiting on the log may lose its response." >&2
     fi
-    rotate_one_log "$OUTPUT_LOG" --force
-    rotate_one_log "$INPUT_LOG" --force
-    prune_logs "$(basename "$OUTPUT_LOG")."
-    prune_logs "$(basename "$INPUT_LOG")."
+    local log
+    for log in "${BRIDGE_LOGS[@]}"; do
+      rotate_one_log "$log" --force
+      prune_logs "$(basename "$log")."
+    done
   else
     if bridge_busy; then
       echo "A request is queued or in flight; skipping rotation (use --force to override)."
@@ -708,20 +1064,49 @@ cmd_rotate_logs() {
 
 usage() {
   cat >&2 <<EOF
-Usage: $(basename "$0") {start|stop|restart|status|suspend [core-path]|resume [core-path]|interrupt [reqid]|rotate-logs [--force]|logs [-f] [lines]}
+Usage: $(basename "$0") {start|stop [--force]|restart|status|suspend [core-path] [--name NAME]|resume [core-path-or-name]|refresh|delete-core <name-or-path> [--force]|interrupt [reqid]|rotate-logs [--force]|logs [-f] [lines]}
 
 Environment:
   SBCL_BRIDGE_DIR       directory the bridge monitors (default: .)
   SBCL_BRIDGE_LISP      path to sbcl-bridge.lisp (default: alongside this script)
   SBCL_BIN              sbcl executable (default: sbcl)
-  SBCL_CORE_RETAIN      number of core images to keep (default: 3)
+  SBCL_CORE_RETAIN      number of UNPINNED, non-current core images to
+                        keep (default: 3) -- named/pinned cores (see
+                        suspend --name) and whatever cores/current.core
+                        points at are exempt and don't count against
+                        this budget, so steady-state disk usage is
+                        this many PLUS the current one, not exactly this
   SBCL_PROCESSED_RETAIN number of archived request files to keep in
                         processed/ (default: 200; pruned on status)
-  SBCL_STOP_TIMEOUT     seconds to wait before SIGKILL on stop (default: 10)
+  SBCL_STOP_TIMEOUT     seconds to wait per escalation phase before
+                        moving to the next one (default: 10)
   SBCL_SUSPEND_TIMEOUT  seconds to wait for suspend to finish (default: 60)
   SBCL_LOG_MAX_BYTES    rotate a log once it exceeds this size (default: 10MiB)
   SBCL_LOG_RETAIN       number of rotated (gzipped) log generations to keep (default: 5)
   SBCL_MEM_WARN_MB      if set, status warns when RSS exceeds this many MB
+
+stop escalates gracefully: cancel any in-flight request, then ask the
+image to exit cleanly (via a stop-request file the bridge's watchdog
+thread checks whether idle or busy), only falling back to SIGTERM then
+SIGKILL if that doesn't work within SBCL_STOP_TIMEOUT. Worst-case
+latency is therefore up to roughly 2*SBCL_STOP_TIMEOUT+10s in the fully
+wedged case, versus SBCL_STOP_TIMEOUT+5s before this escalation
+existed. Use --force to skip straight to SIGTERM/SIGKILL, e.g. if the
+bridge's watchdog thread is itself wedged (interrupt-thread delivery
+needs a safepoint; tight native/non-consing code on the main thread can
+stall it indefinitely).
+
+suspend --name NAME saves to cores/NAME.core (instead of the default
+timestamp name) and marks it pinned: exempt from SBCL_CORE_RETAIN's
+automatic pruning, deletable only via delete-core. resume and
+delete-core both accept a bare NAME in place of a full core path.
+
+refresh is stop + resume from cores/current.core -- the core that was
+actually live before the stop, not necessarily the newest file on disk
+(those differ if you explicitly resumed an older core). Compare
+restart, which is stop + a FRESH start with no saved state. Errors out
+if there's no current-core symlink yet (a bridge directory that's only
+ever done a plain start, never suspended or resumed).
 
 interrupt cancels whatever request is currently being evaluated (or a
 specific one, by reqid). It has no effect once a request has already
@@ -744,11 +1129,13 @@ EOF
 [ $# -ge 1 ] || usage
 case "$1" in
   start)       cmd_start ;;
-  stop)        cmd_stop ;;
+  stop)        shift; cmd_stop "${1:-}" ;;
   restart)     cmd_restart ;;
   status)      cmd_status ;;
-  suspend)     shift; cmd_suspend "${1:-}" ;;
+  suspend)     shift; cmd_suspend "$@" ;;
   resume)      shift; cmd_resume "${1:-}" ;;
+  refresh)     cmd_refresh ;;
+  delete-core) shift; cmd_delete_core "$@" ;;
   interrupt)   shift; cmd_interrupt "${1:-}" ;;
   rotate-logs) shift; cmd_rotate_logs "${1:-}" ;;
   logs)        shift; cmd_logs "$@" ;;

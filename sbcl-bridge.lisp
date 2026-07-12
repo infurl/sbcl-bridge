@@ -58,11 +58,28 @@
 ;;;;   includes a captured backtrace (BACKTRACE-BEGIN/BACKTRACE-END
 ;;;;   markers, truncated to *bridge-backtrace-frames* frames, default
 ;;;;   20), captured via handler-bind before the stack unwinds. A
-;;;;   *debugger-hook* is also installed as a last-resort backstop: if
-;;;;   something still escapes all of that, it is logged with the
-;;;;   active request id before the process exits, rather than
+;;;;   *debugger-hook* is also installed as a last-resort backstop, and
+;;;;   distinguishes which thread hit it: on the bridge's own main
+;;;;   thread, something escaping all of the above is logged with the
+;;;;   active request id and the whole process exits, rather than
 ;;;;   dropping into (or hanging in) a debugger with no terminal
-;;;;   attached.
+;;;;   attached; on any OTHER thread (e.g. one evaluated code itself
+;;;;   spawned, such as a web server's request-handler threads), the
+;;;;   condition and a backtrace are instead logged to
+;;;;   sbcl-async-errors.log and only that thread is terminated -- the
+;;;;   bridge and the rest of the process keep running, since one
+;;;;   unrelated background thread faulting has nothing to do with the
+;;;;   bridge's own health.
+;;;;
+;;;; Stopping:
+;;;;   Beyond OS signals, a STOP-FILE-NAME control file (default
+;;;;   "stop-request") triggers a graceful (SB-EXT:EXIT) from within the
+;;;;   Lisp image itself, checked by the same watchdog thread that
+;;;;   handles cancellation -- but unconditionally, whether or not a
+;;;;   request is in flight (cancellation only ever does something
+;;;;   mid-request). sbcl-bridge-ctl.sh's `stop` uses this as its
+;;;;   default path, falling back to signals only if it doesn't work
+;;;;   within SBCL_STOP_TIMEOUT.
 ;;;;
 ;;;; Suspend/resume:
 ;;;;   Calling (sbcl-bridge:suspend-bridge :core-path "...") from within
@@ -83,6 +100,18 @@
 ;;;;   workspace mounted at different paths in different environments
 ;;;;   (a host and a container, say) is exactly the situation a saved
 ;;;;   absolute path can't survive on its own.
+;;;;
+;;;;   An optional :NAME argument to SUSPEND-BRIDGE marks a core
+;;;;   pinned (a co-located "<core-path>.pinned" sidecar) -- exempt
+;;;;   from sbcl-bridge-ctl.sh's automatic core-retention pruning,
+;;;;   deletable only via its `delete-core` command. Separately,
+;;;;   sbcl-bridge-ctl.sh maintains a "cores/current.core" symlink
+;;;;   pointing at whichever core was actually resumed-from or
+;;;;   suspended-to most recently, which its `refresh` command (stop +
+;;;;   resume from that symlink, as opposed to `restart`'s stop + fresh
+;;;;   start) relies on -- this file has no role in maintaining that
+;;;;   symlink itself, that logic lives entirely in the shell/Lisp
+;;;;   client control surfaces.
 
 (defpackage :sbcl-bridge
   (:use :cl)
@@ -135,6 +164,14 @@ environment on resume, same reasoning as *bridge-poll-interval*.")
   "Name of the control file an external tool can drop in the bridge
 directory to cancel whatever request is currently running.")
 
+(defparameter *stop-file-name* "stop-request"
+  "Name of the control file an external tool can drop in the bridge
+directory to request a graceful shutdown -- see WATCHDOG-LOOP and
+GRACEFUL-EXIT-NOW. Unlike *CANCEL-FILE-NAME*, the watchdog checks for
+this unconditionally, whether or not a request is currently running:
+cancellation only ever makes sense against an in-flight request, but
+stopping needs to reach an idle bridge too.")
+
 (defvar *bridge-working-path* nil
   "Full pathname of the claimed-request file (next-sbcl-input.working)
 for the running bridge loop; set by run-bridge. Lets suspend-bridge
@@ -157,6 +194,14 @@ bridge loop; set by run-bridge. See *bridge-working-path*.")
   "Handle to the running watchdog thread, if any. save-lisp-and-die
 refuses to run with other threads alive, so suspend-bridge must stop
 this one first.")
+
+(defvar *bridge-main-thread* nil
+  "The bridge's main thread (the one running RUN-BRIDGE's loop and, in
+turn, EVAL-AND-REPORT), captured once at the top of RUN-BRIDGE. Lets
+code distinguish an unhandled condition on this thread specifically --
+which is genuinely fatal to the bridge's whole contract -- from one on
+some other thread, e.g. one evaluated code itself spawned, which is
+not.")
 
 (defvar *current-request-lock* (sb-thread:make-mutex :name "bridge-current-request"))
 (defvar *current-request-id* nil
@@ -217,6 +262,40 @@ WITH-OUTPUT-LOCK (recursively).")
   `(sb-thread:with-recursive-lock (*output-lock*)
      ,@body))
 
+(defun capture-backtrace (&key (count *bridge-backtrace-frames*))
+  "Capture the current call stack as a string, deepest-caller-first,
+bounded to COUNT frames, via sb-debug:print-backtrace. Must be called
+from within the dynamic extent of the condition being reported (i.e.
+from a handler-bind handler, not a handler-case handler, since
+handler-case has already unwound the stack by the time its handler
+body runs). Defined up here, ahead of most of this file's other
+helpers, specifically so both INSTALL-DEBUGGER-HOOK (via
+LOG-ASYNC-ERROR, just below) and REPORT-CONDITION (further down) can
+call it without forward-reference warnings -- it has no dependencies of
+its own beyond *BRIDGE-BACKTRACE-FRAMES*, defined earlier still.
+
+An earlier version of this function walked frames itself via
+sb-debug:map-backtrace/print-frame-call, filtering out bridge-internal
+frames by searching each printed frame for the substring
+\"SBCL-BRIDGE\". That approach is retired -- verified directly (not
+assumed) that it silently produced an EMPTY backtrace whenever this
+file is loaded whole via --load, i.e. on every normal bridge startup,
+while the identical code worked fine compiled standalone (e.g.
+resubmitted as an ordinary request against an already-running bridge).
+Root cause not tracked down further, since sb-debug:print-backtrace
+alone was confirmed to work correctly in exactly the failing case, and
+is simpler besides: its own :COUNT already bounds output length, and
+its default rendering already includes bridge-internal frames
+(RUN-FORMS, EVAL-AND-REPORT, and so on) rather than filtering them --
+which turned out not to be a loss, since the retired filter never
+actually matched anything in the first place: PRINT-FRAME-CALL, unlike
+PRINT-BACKTRACE, renders frame text without package qualification, so a
+literal \"SBCL-BRIDGE\" search against its output could never have
+fired."
+  (with-output-to-string (out)
+    (ignore-errors
+      (sb-debug:print-backtrace :stream out :count count :print-thread nil))))
+
 ;;; ---------------------------------------------------------------------
 ;;; Debugger-hook backstop
 ;;;
@@ -226,21 +305,98 @@ WITH-OUTPUT-LOCK (recursively).")
 ;;; was active, using our own markers, before that happens. This should
 ;;; be rare: the per-request handler-case in eval-and-report is meant
 ;;; to catch everything routine first.
+;;;
+;;; That per-request handling only covers the bridge's own main thread,
+;;; though. Code submitted to the bridge is free to spawn its own
+;;; threads (e.g. a web server started as a background service), and an
+;;; unhandled condition on one of THOSE has nowhere to go by default --
+;;; it would either die silently or, depending on how the thread was
+;;; created, drop into a debugger with no terminal attached. The hook
+;;; below distinguishes the two cases: on the bridge's own main thread,
+;;; an unhandled condition is genuinely fatal to the bridge's whole
+;;; contract, so the existing behavior (log and exit the process)
+;;; stands unchanged; on any other thread, killing the entire bridge
+;;; over one background thread's fault would be a severe regression, so
+;;; this instead logs a full report to a dedicated async-error log and
+;;; terminates only that thread.
+
+(defvar *async-error-log-path* nil
+  "Full pathname of the async-error log for the running bridge loop, or
+NIL before RUN-BRIDGE has set it. Recomputed fresh from the bridge
+directory on every start or resume -- unlike the request/response logs,
+there is no suspend/resume state to preserve here: a resumed image is a
+new process, and this path merges the same way every time.")
+
+(defvar *async-error-log-lock* (sb-thread:make-mutex :name "bridge-async-error-log")
+  "Serializes writes to *ASYNC-ERROR-LOG-PATH* across however many
+threads might fault around the same time. Deliberately a SEPARATE lock
+from *OUTPUT-LOCK*: that one guards *standard-output*, a different
+file entirely, and coupling a background thread's fault-logging to
+whatever the main thread happens to be doing on stdout at that moment
+would add contention for no benefit. The same reasoning that keeps the
+main-thread FATAL branch below outside WITH-OUTPUT-LOCK applies here
+too: a last-gasp error-logging path must not be blockable by a wedged
+lock holder.")
+
+(defmacro with-async-error-log-lock (&body body)
+  `(sb-thread:with-recursive-lock (*async-error-log-lock*) ,@body))
+
+(defun log-async-error (condition)
+  "Appends a backtrace report for CONDITION -- signalled on some thread
+other than the bridge's main thread -- to *ASYNC-ERROR-LOG-PATH*. Never
+signals: this is called from a debugger hook that is itself the last
+resort before the signalling thread would otherwise vanish with no
+record of why."
+  (ignore-errors
+    (let ((thread-name (or (sb-thread:thread-name sb-thread:*current-thread*) "unnamed")))
+      (with-async-error-log-lock
+        (with-open-file (s *async-error-log-path*
+                            :direction :output
+                            :if-exists :append :if-does-not-exist :create
+                            :external-format :utf-8)
+          (format s "~&;;; ASYNC-ERROR thread=~a ts=~a condition=~a~%"
+                  thread-name (get-universal-time) condition)
+          (format s "~&;;; BACKTRACE-BEGIN thread=~a~%" thread-name)
+          (write-string (capture-backtrace) s)
+          (format s "~&;;; BACKTRACE-END thread=~a~%" thread-name)
+          (finish-output s))))))
 
 (defun install-debugger-hook ()
   (let ((hook (lambda (condition previous-hook)
                 (declare (ignore previous-hook))
-                ;; Deliberately NOT under with-output-lock: this is a
-                ;; last-gasp path on the way to process exit, and a
-                ;; wedged lock holder must not be able to block it.
-                ;; Worst case is one garbled line in a log that's about
-                ;; to end anyway.
-                (ignore-errors
-                  (format t "~&;;; FATAL id=~a condition=~a~%"
-                          (or (current-request-id) "none") condition)
-                  (format t "~&;;; BRIDGE EXITING due to an unhandled condition~%")
-                  (finish-output))
-                (sb-ext:exit :code 70 :abort t))))
+                (if (or (null *bridge-main-thread*)
+                        (eq sb-thread:*current-thread* *bridge-main-thread*))
+                    ;; The bridge's own main thread (or #-sb-thread,
+                    ;; where there is only ever one thread) -- unchanged
+                    ;; from before this distinction existed. Deliberately
+                    ;; NOT under with-output-lock: this is a last-gasp
+                    ;; path on the way to process exit, and a wedged
+                    ;; lock holder must not be able to block it. Worst
+                    ;; case is one garbled line in a log that's about to
+                    ;; end anyway.
+                    (progn
+                      (ignore-errors
+                        (format t "~&;;; FATAL id=~a condition=~a~%"
+                                (or (current-request-id) "none") condition)
+                        (format t "~&;;; BRIDGE EXITING due to an unhandled condition~%")
+                        (finish-output))
+                      (sb-ext:exit :code 70 :abort t))
+                    ;; Some other thread. Log it, then terminate ONLY
+                    ;; this thread -- deliberately not sb-ext:exit here:
+                    ;; called from a non-main thread, its default
+                    ;; behavior is to ask the MAIN thread to exit the
+                    ;; whole process, which is exactly the regression
+                    ;; this branch exists to avoid. ABORT-THREAD is
+                    ;; resolved indirectly, the same defensive idiom
+                    ;; CAPTURE-BACKTRACE already uses for MAP-BACKTRACE/
+                    ;; PRINT-FRAME-CALL, in case a future SBCL renames
+                    ;; or removes it; if unavailable, there is nothing
+                    ;; safer left to do than let the thread fall through
+                    ;; whatever its own top-of-thread handling is.
+                    (progn
+                      (log-async-error condition)
+                      (let ((abort-thread (find-symbol "ABORT-THREAD" :sb-thread)))
+                        (when abort-thread (funcall abort-thread))))))))
     ;; Set BOTH the ANSI hook and SBCL's extension hook. invoke-debugger
     ;; consults cl:*debugger-hook* first per the standard, but
     ;; --non-interactive/--disable-debugger installs SBCL's own
@@ -424,7 +580,7 @@ timeout rather than timing out immediately."
     (format log "~&;;; BEGIN-INPUT id=~a ts=~a~%" reqid (get-universal-time))
     (write-string raw-text log)
     (unless (ends-with-newline-p raw-text) (terpri log))
-    (format log ";;; END-INPUT id=~a~%~%" reqid)
+    (format log ";;; END-INPUT id=~a ts=~a~%~%" reqid (get-universal-time))
     (finish-output log)))
 
 (defun safe-prin1-to-string (value)
@@ -453,40 +609,6 @@ each form's values."
             (format t "~&;;; => ~{~a~^ ; ~}~%"
                     (mapcar #'safe-prin1-to-string values))))))))
 
-(defun capture-backtrace (&key (count *bridge-backtrace-frames*))
-  "Capture the current call stack as a string, deepest-caller-first,
-stopping at COUNT frames or as soon as bridge-internal machinery is
-reached (whichever comes first) -- frames from run-forms on down are
-our own polling/eval plumbing, never useful to someone debugging their
-own submitted code. Must be called from within the dynamic extent of
-the condition being reported (i.e. from a handler-bind handler, not a
-handler-case handler, since handler-case has already unwound the stack
-by the time its handler body runs).
-
-Falls back to the unfiltered sb-debug:print-backtrace if the internal
-frame-walking functions this relies on aren't available (they are
-present but unexported across the SBCL versions this was tested
-against; a future SBCL could rename them)."
-  (with-output-to-string (out)
-    (let ((n 0))
-      (handler-case
-          (block done
-            (funcall (find-symbol "MAP-BACKTRACE" :sb-debug)
-             (lambda (frame)
-               (when (>= n count) (return-from done))
-               (let ((line (string-right-trim
-                            '(#\Newline)
-                            (with-output-to-string (s)
-                              (funcall (find-symbol "PRINT-FRAME-CALL" :sb-debug)
-                                       frame s)))))
-                 (when (search "SBCL-BRIDGE" line)
-                   (return-from done))
-                 (format out "~d: ~a~%" n line)
-                 (incf n)))))
-        (error ()
-          (ignore-errors
-            (sb-debug:print-backtrace :stream out :count count :print-thread nil)))))))
-
 (defun report-condition (label condition reqid)
   "Print a labeled condition report plus a bracketed backtrace to
 *standard-output*."
@@ -495,6 +617,27 @@ against; a future SBCL could rename them)."
     (format t "~&;;; BACKTRACE-BEGIN id=~a~%" reqid)
     (write-string (capture-backtrace))
     (format t "~&;;; BACKTRACE-END id=~a~%" reqid)))
+
+(defun elapsed-ms-since (t0)
+  "Milliseconds elapsed since T0, a value previously returned by
+GET-INTERNAL-REAL-TIME."
+  (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second))
+
+(defun emit-end-output (reqid status t0 c0)
+  "Prints the END-OUTPUT marker for REQID with STATUS, plus a timestamp
+and how much wall time/memory this request cost -- elapsed-ms via
+GET-INTERNAL-REAL-TIME, consed-bytes via a before/after diff of
+SB-EXT:GET-BYTES-CONSED. T0/C0 are the values of those two calls,
+captured right after BEGIN-OUTPUT was printed, so the measurement
+covers evaluation only, not the bridge's own marker I/O. Called from
+every exit path of EVAL-AND-REPORT uniformly, including non-ok
+outcomes: knowing how much time/memory a request burned before
+erroring, timing out, or being cancelled is itself useful diagnostic
+information, not just something worth knowing on success."
+  (with-output-lock
+    (format t "~&;;; END-OUTPUT id=~a status=~a ts=~a elapsed-ms=~a consed-bytes=~a~%"
+            reqid status (get-universal-time)
+            (elapsed-ms-since t0) (- (sb-ext:get-bytes-consed) c0))))
 
 (defun eval-and-report (reqid raw-text timeout)
   "Evaluate each top-level form in RAW-TEXT, printing values and status
@@ -506,60 +649,57 @@ request-cancelled condition.
 Uses handler-bind rather than handler-case so that backtraces can be
 captured from the original signalling context, before the stack
 unwinds."
-  (with-output-lock
-    (format t "~&;;; BEGIN-OUTPUT id=~a ts=~a~%" reqid (get-universal-time))
-    (finish-output))
-  ;; *evaluating-request* tells a late-arriving cancellation interrupt
-  ;; that it is still safe to signal request-cancelled here (the
-  ;; handlers below are established); see the defvar for the race this
-  ;; prevents.
-  (let ((*evaluating-request* t))
-   (block done
-    (handler-bind
-        ((request-cancelled
-           (lambda (c)
-             (with-output-lock
-               (format t "~&;;; CANCELLED: ~a~%" c)
-               (format t "~&;;; END-OUTPUT id=~a status=cancelled~%" reqid))
-             (return-from done)))
-         (sb-ext:timeout
-           (lambda (c)
-             (declare (ignore c))
-             (with-output-lock
-               (format t "~&;;; TIMEOUT after ~a seconds~%" timeout)
-               (format t "~&;;; END-OUTPUT id=~a status=timeout~%" reqid))
-             (return-from done)))
-         (storage-condition
-           (lambda (c)
-             ;; Heap/stack exhaustion etc. -- not a subtype of ERROR.
-             ;; Grab a shallow backtrace before trying to claw back
-             ;; some breathing room via GC.
-             (report-condition "STORAGE-CONDITION" c reqid)
-             (ignore-errors (sb-ext:gc :full t))
-             (with-output-lock
-               (format t "~&;;; END-OUTPUT id=~a status=fatal-condition~%" reqid))
-             (return-from done)))
-         (error
-           (lambda (c)
-             (report-condition "ERROR" c reqid)
-             (with-output-lock
-               (format t "~&;;; END-OUTPUT id=~a status=error~%" reqid))
-             (return-from done)))
-         (serious-condition
-           (lambda (c)
-             ;; Catch-all for anything else serious that isn't a plain
-             ;; ERROR, so it can't reach the debugger hook and kill
-             ;; the process.
-             (report-condition "SERIOUS-CONDITION" c reqid)
-             (with-output-lock
-               (format t "~&;;; END-OUTPUT id=~a status=fatal-condition~%" reqid))
-             (return-from done))))
-      (if (and timeout (plusp timeout))
-          (sb-ext:with-timeout timeout (run-forms raw-text))
-          (run-forms raw-text))
-      (with-output-lock
-        (format t "~&;;; END-OUTPUT id=~a status=ok~%" reqid)))))
-  (finish-output))
+  (let (t0 c0)
+    (with-output-lock
+      (format t "~&;;; BEGIN-OUTPUT id=~a ts=~a~%" reqid (get-universal-time))
+      (finish-output))
+    (setf t0 (get-internal-real-time)
+          c0 (sb-ext:get-bytes-consed))
+    ;; *evaluating-request* tells a late-arriving cancellation interrupt
+    ;; that it is still safe to signal request-cancelled here (the
+    ;; handlers below are established); see the defvar for the race this
+    ;; prevents.
+    (let ((*evaluating-request* t))
+      (block done
+        (handler-bind
+            ((request-cancelled
+               (lambda (c)
+                 (with-output-lock (format t "~&;;; CANCELLED: ~a~%" c))
+                 (emit-end-output reqid "cancelled" t0 c0)
+                 (return-from done)))
+             (sb-ext:timeout
+               (lambda (c)
+                 (declare (ignore c))
+                 (with-output-lock (format t "~&;;; TIMEOUT after ~a seconds~%" timeout))
+                 (emit-end-output reqid "timeout" t0 c0)
+                 (return-from done)))
+             (storage-condition
+               (lambda (c)
+                 ;; Heap/stack exhaustion etc. -- not a subtype of ERROR.
+                 ;; Grab a shallow backtrace before trying to claw back
+                 ;; some breathing room via GC.
+                 (report-condition "STORAGE-CONDITION" c reqid)
+                 (ignore-errors (sb-ext:gc :full t))
+                 (emit-end-output reqid "fatal-condition" t0 c0)
+                 (return-from done)))
+             (error
+               (lambda (c)
+                 (report-condition "ERROR" c reqid)
+                 (emit-end-output reqid "error" t0 c0)
+                 (return-from done)))
+             (serious-condition
+               (lambda (c)
+                 ;; Catch-all for anything else serious that isn't a plain
+                 ;; ERROR, so it can't reach the debugger hook and kill
+                 ;; the process.
+                 (report-condition "SERIOUS-CONDITION" c reqid)
+                 (emit-end-output reqid "fatal-condition" t0 c0)
+                 (return-from done))))
+          (if (and timeout (plusp timeout))
+              (sb-ext:with-timeout timeout (run-forms raw-text))
+              (run-forms raw-text))
+          (emit-end-output reqid "ok" t0 c0))))
+    (finish-output)))
 
 (defun process-one (working-path input-log-path default-timeout)
   "Log and evaluate the claimed request file. Returns its reqid."
@@ -576,47 +716,81 @@ unwinds."
 ;;; ---------------------------------------------------------------------
 ;;; Watchdog thread (cancellation)
 
+(defun graceful-exit-now ()
+  "Interrupt-thread target for a graceful stop request (see
+WATCHDOG-LOOP): logs and exits cleanly. Runs on the main thread,
+whether that thread was idle (sleeping in RUN-BRIDGE's poll loop) or
+mid-request -- unlike cancellation, a stop request doesn't need to
+check *EVALUATING-REQUEST*/*CURRENT-REQUEST-ID* first, since exiting
+is the right outcome either way. :ABORT NIL (rather than the debugger
+hook's :ABORT T) lets unwind-protect cleanup forms run on the way out,
+which matters for save-lisp-and-die-adjacent invariants like the
+watchdog thread needing to be stopped before certain operations --
+though ordinary evaluation doesn't rely on that, this is the more
+correct default for a DELIBERATE, requested exit as opposed to the
+debugger hook's own last-gasp, something-already-went-wrong path."
+  (with-output-lock
+    (format t "~&;;; SBCL-BRIDGE EXITING (graceful stop requested) ts=~a~%" (get-universal-time))
+    (finish-output))
+  (sb-ext:exit :code 0 :abort nil))
+
 (defun watchdog-loop (dir main-thread poll-interval)
-  "Runs for the lifetime of the bridge. Watches for a small control
-file (*cancel-file-name*) and, if it names (or leaves blank, meaning
-'whatever is current') a request that matches the one currently
-executing, asynchronously interrupts the main thread with a
-request-cancelled condition."
-  (let ((cancel-path (merge-pathnames *cancel-file-name* dir)))
+  "Runs for the lifetime of the bridge. Watches for two small control
+files:
+
+- *CANCEL-FILE-NAME*: if it names (or leaves blank, meaning 'whatever
+  is current') a request that matches the one currently executing,
+  asynchronously interrupts the main thread with a request-cancelled
+  condition. Only ever does anything if a request is in flight.
+
+- *STOP-FILE-NAME*: checked UNCONDITIONALLY, whether or not a request
+  is in flight -- unlike cancellation, a graceful stop needs to reach
+  an idle bridge too, since 'nothing is running' is the common case
+  someone stopping a bridge will find it in. Interrupts the main
+  thread with GRACEFUL-EXIT-NOW."
+  (let ((cancel-path (merge-pathnames *cancel-file-name* dir))
+        (stop-path (merge-pathnames *stop-file-name* dir)))
     (loop
       (handler-case
-          (when (probe-file cancel-path)
-            (let ((target (string-trim '(#\Space #\Tab #\Newline #\Return)
-                                        (slurp-file cancel-path))))
-              (ignore-errors (delete-file cancel-path))
-              (let ((current (current-request-id)))
-                (when (and current
-                           (or (zerop (length target)) (string= target current)))
-                  (with-output-lock
-                    (format t "~&;;; CANCEL-REQUESTED id=~a~%" current)
-                    (finish-output))
-                  (sb-thread:interrupt-thread
-                   main-thread
-                   (lambda ()
-                     ;; This runs ON the main thread, at whatever point
-                     ;; the interrupt lands. Only signal if that thread
-                     ;; is still inside eval-and-report evaluating the
-                     ;; SAME request; if the request finished (or a new
-                     ;; one started) in the window between the check
-                     ;; above and delivery here, silently do nothing --
-                     ;; there would be no handler for request-cancelled
-                     ;; anymore and it would spuriously trip the main
-                     ;; loop's LOOP-ERROR backstop. *current-request-id*
-                     ;; is read lock-free on purpose: the main thread is
-                     ;; its only writer and we ARE the main thread here,
-                     ;; and taking the mutex could self-deadlock if the
-                     ;; interrupt lands inside set/clear-current-request.
-                     (when (and *evaluating-request*
-                                (equal current *current-request-id*))
-                       (error 'request-cancelled :reqid current))))))))
+          (progn
+            (when (probe-file stop-path)
+              (ignore-errors (delete-file stop-path))
+              (with-output-lock
+                (format t "~&;;; STOP-REQUESTED ts=~a~%" (get-universal-time))
+                (finish-output))
+              (sb-thread:interrupt-thread main-thread #'graceful-exit-now))
+            (when (probe-file cancel-path)
+              (let ((target (string-trim '(#\Space #\Tab #\Newline #\Return)
+                                          (slurp-file cancel-path))))
+                (ignore-errors (delete-file cancel-path))
+                (let ((current (current-request-id)))
+                  (when (and current
+                             (or (zerop (length target)) (string= target current)))
+                    (with-output-lock
+                      (format t "~&;;; CANCEL-REQUESTED id=~a ts=~a~%" current (get-universal-time))
+                      (finish-output))
+                    (sb-thread:interrupt-thread
+                     main-thread
+                     (lambda ()
+                       ;; This runs ON the main thread, at whatever point
+                       ;; the interrupt lands. Only signal if that thread
+                       ;; is still inside eval-and-report evaluating the
+                       ;; SAME request; if the request finished (or a new
+                       ;; one started) in the window between the check
+                       ;; above and delivery here, silently do nothing --
+                       ;; there would be no handler for request-cancelled
+                       ;; anymore and it would spuriously trip the main
+                       ;; loop's LOOP-ERROR backstop. *current-request-id*
+                       ;; is read lock-free on purpose: the main thread is
+                       ;; its only writer and we ARE the main thread here,
+                       ;; and taking the mutex could self-deadlock if the
+                       ;; interrupt lands inside set/clear-current-request.
+                       (when (and *evaluating-request*
+                                  (equal current *current-request-id*))
+                         (error 'request-cancelled :reqid current)))))))))
         (error (c)
           (with-output-lock
-            (format t "~&;;; WATCHDOG-ERROR: ~a~%" c)
+            (format t "~&;;; WATCHDOG-ERROR: ~a ts=~a~%" c (get-universal-time))
             (finish-output))))
       (sleep poll-interval))))
 
@@ -1091,6 +1265,168 @@ something computed earlier could plausibly be stale."
     (setf *synced-cl-source-registry* env-registry)))
 
 ;;; ---------------------------------------------------------------------
+;;; Startup PID-file claim and duplicate-process detection
+;;;
+;;; run-bridge writes its own PID file as the first thing it does (see
+;;; the top-of-file comment on SB-UNIX:UNIX-GETPID, above run-bridge,
+;;; for why it, not whatever launched it, is authoritative about its
+;;; own PID). What that alone doesn't prevent is two launchers racing
+;;; to start a bridge against the same directory at once: both could
+;;; observe "no PID file yet" and both proceed, leaving two processes
+;;; polling and claiming from the same request queue, unpredictably.
+;;; CLAIM-PID-FILE closes that gap.
+
+(defun proc-file-path (pid name)
+  (format nil "/proc/~a/~a" pid name))
+
+(defun proc-available-p ()
+  (probe-file "/proc/"))
+
+(defun slurp-proc-file-bytes (path)
+  "Reads PATH (expected to be a /proc file) as raw bytes, in a growing
+loop rather than trusting FILE-LENGTH up front -- /proc files report a
+length of 0 regardless of their actual content. Returns NIL if PATH
+can't be opened at all (process already gone, permission denied, or
+/proc simply isn't there)."
+  (ignore-errors
+    (with-open-file (in path :direction :input
+                         :element-type '(unsigned-byte 8)
+                         :if-does-not-exist nil)
+      (when in
+        (let ((buf (make-array 65536 :element-type '(unsigned-byte 8)))
+              (chunks '()))
+          (loop
+            (let ((n (read-sequence buf in)))
+              (when (plusp n) (push (subseq buf 0 n) chunks))
+              (when (< n (length buf)) (return))))
+          (apply #'concatenate '(vector (unsigned-byte 8)) (nreverse chunks)))))))
+
+(defun split-on-nul (string)
+  (loop with start = 0
+        for pos = (position #\Nul string :start start)
+        collect (subseq string start pos)
+        while pos
+        do (setf start (1+ pos))))
+
+(defun proc-environ-value (pid key)
+  "Reads /proc/<pid>/environ (a run of NUL-separated KEY=VALUE entries)
+and returns the value for KEY, or NIL if unreadable or KEY isn't set.
+Used to confirm a live process named in our PID file is actually a
+bridge watching OUR directory, not an unrelated process that happens to
+have inherited the same PID number after the original bridge exited
+(PIDs are recycled by the OS over time -- trusting a live PID's mere
+existence, with no identity check, would eventually misidentify some
+unrelated process as a conflicting bridge)."
+  (let ((bytes (slurp-proc-file-bytes (proc-file-path pid "environ"))))
+    (when bytes
+      (let ((text (ignore-errors (sb-ext:octets-to-string bytes :external-format :utf-8)))
+            (prefix (concatenate 'string key "=")))
+        (when text
+          (dolist (entry (split-on-nul text))
+            (when (and (>= (length entry) (length prefix))
+                       (string= entry prefix :end1 (length prefix)))
+              (return-from proc-environ-value (subseq entry (length prefix))))))))))
+
+(defun proc-cmdline-looks-like-sbcl-p (pid)
+  "Mirrors sbcl-bridge-ctl.sh's IS_RUNNING cmdline heuristic: T if
+/proc/<pid>/cmdline contains \"sbcl\" or \".core\". Used only as a
+fallback identity signal, when /proc/<pid>/environ can't be read at all
+(permissions, or a non-Linux /proc)."
+  (let ((bytes (slurp-proc-file-bytes (proc-file-path pid "cmdline"))))
+    (when bytes
+      (let ((text (ignore-errors (sb-ext:octets-to-string bytes :external-format :utf-8))))
+        (and text (or (search "sbcl" text) (search ".core" text)) t)))))
+
+(defun proc-alive-p (pid)
+  "T if a process with this PID currently exists. Checked via /proc
+where available (cheap, no subprocess); falls back to shelling out to
+kill(1) -0 elsewhere -- SB-POSIX:KILL would be the obvious alternative,
+but this file deliberately requires no contribs (see the top-of-file
+comment on SB-UNIX:UNIX-GETPID, above run-bridge), and a subprocess call
+is a small price for a fallback path that, on this deployment, should
+rarely if ever actually run."
+  (if (proc-available-p)
+      (and (probe-file (proc-file-path pid "")) t)
+      (ignore-errors
+        (let ((process (sb-ext:run-program "kill" (list "-0" (princ-to-string pid))
+                                            :search t :output nil :error nil
+                                            :input nil :wait t)))
+          (and process (eql (sb-ext:process-exit-code process) 0))))))
+
+(defun pid-file-identity-conflict-p (pid directory)
+  "T if PID is alive and appears to be another bridge watching
+DIRECTORY -- a genuine conflict, meaning our caller must refuse to
+start. NIL if PID is alive but looks unrelated (a different directory,
+confirmed via /proc/<pid>/environ) or unconfirmable-and-not-sbcl-like
+(via the PROC-CMDLINE-LOOKS-LIKE-SBCL-P fallback) -- meaning the PID
+file is just stale or wrong for us and can be cleaned up rather than
+treated as a conflict."
+  (let ((their-dir (proc-environ-value pid "SBCL_BRIDGE_DIR")))
+    (if their-dir
+        (paths-equal-p their-dir directory)
+        (proc-cmdline-looks-like-sbcl-p pid))))
+
+(defun refuse-duplicate-start (pid directory)
+  (ignore-errors
+    (format t "~&;;; REFUSING TO START: pid=~a already appears to be an sbcl-bridge watching ~a ts=~a~%"
+            pid directory (get-universal-time))
+    (finish-output))
+  (sb-ext:exit :code 78 :abort t))
+
+(defun write-pid-file-unconditionally (path)
+  "The pre-hardening behavior: just write our PID, no questions asked.
+Used both as CLAIM-PID-FILE's fallback when something prevents it from
+reasoning about an existing file at all (rather than refusing to start
+over a filesystem hiccup unrelated to any real conflict), and as its
+last resort after repeated retries."
+  (ignore-errors
+    (with-open-file (s path :direction :output
+                        :if-exists :supersede :if-does-not-exist :create)
+      (format s "~a~%" (sb-unix:unix-getpid))))
+  t)
+
+(defun claim-pid-file (path directory &optional (retries-left 5))
+  "Attempts to become the authoritative bridge for DIRECTORY by
+exclusively creating the PID file at PATH -- this exclusive create is
+the actual race-breaker: two processes can each observe \"no PID file
+yet\" and both proceed, but only one can win an :IF-EXISTS :ERROR open
+on the same path. The loser (or a normal, non-racing start that simply
+finds a leftover PID file) then inspects whatever is already there: a
+dead PID is cleaned up automatically and the claim retried; a live PID
+that's confirmed to be another bridge on this same DIRECTORY is a
+genuine conflict, and this process refuses to start at all
+(REFUSE-DUPLICATE-START, which does not return); a live PID that looks
+unrelated is treated the same as a dead one. Never signals -- if
+something prevents reasoning about an existing file at all (e.g. it's
+unreadable), this falls back to the pre-hardening unconditional
+overwrite rather than refusing to start over a problem that has nothing
+to do with an actual conflict."
+  (when (zerop retries-left)
+    (return-from claim-pid-file (write-pid-file-unconditionally path)))
+  (let ((claimed (ignore-errors
+                    (with-open-file (s path :direction :output
+                                        :if-exists :error :if-does-not-exist :create)
+                      (format s "~a~%" (sb-unix:unix-getpid))
+                      t))))
+    (when claimed (return-from claim-pid-file t))
+    (let* ((contents (ignore-errors (slurp-file path)))
+           (existing-pid (and contents (ignore-errors (parse-integer contents :junk-allowed t)))))
+      (cond
+        ((null existing-pid) (write-pid-file-unconditionally path))
+        ((not (proc-alive-p existing-pid))
+         (ignore-errors
+           (format t "~&;;; STALE PID FILE: pid=~a not running; cleaning up automatically ts=~a~%"
+                   existing-pid (get-universal-time))
+           (finish-output))
+         (ignore-errors (delete-file path))
+         (claim-pid-file path directory (1- retries-left)))
+        ((pid-file-identity-conflict-p existing-pid directory)
+         (refuse-duplicate-start existing-pid directory))
+        (t
+         (ignore-errors (delete-file path))
+         (claim-pid-file path directory (1- retries-left)))))))
+
+;;; ---------------------------------------------------------------------
 ;;; Main loop
 
 (defun run-bridge (&key (directory (error "DIRECTORY is required"))
@@ -1100,15 +1436,59 @@ something computed earlier could plausibly be stale."
                          (input-name "next-sbcl-input.lisp")
                          (working-name "next-sbcl-input.working")
                          (input-log-name "sbcl-input.log")
+                         (async-error-log-name "sbcl-async-errors.log")
                          (archive-subdir "processed"))
   "Monitor DIRECTORY for INPUT-NAME; when found, atomically claim it,
 log it, evaluate it, and print correlated markers to *standard-output*.
 Does not return under normal operation."
+  ;; Write our own PID file, as the VERY FIRST thing this function
+  ;; does, before even DIRECTORY gets normalized. This is deliberately
+  ;; NOT left to whatever launched us (sbcl-bridge-ctl.sh's own
+  ;; cmd_start, or a caller using sb-ext:run-program) to figure out and
+  ;; record correctly on our behalf -- a real, reproducible gap was
+  ;; found here: `setsid CMD` does not always preserve CMD's PID across
+  ;; the exec. The setsid(2) syscall requires its caller not already be
+  ;; a process group leader; when it IS (which turns out to depend on
+  ;; how the immediate parent set up the child before exec -- bash's
+  ;; own job-control backgrounding avoids this, but SB-EXT:RUN-PROGRAM's
+  ;; child setup does not), the `setsid` UTILITY silently forks a new
+  ;; child to work around that restriction rather than exec-ing
+  ;; in place, so the PID a launcher captured (bash's $!, or
+  ;; SB-EXT:PROCESS-PID of the call that invoked setsid) ends up naming
+  ;; the now-exited setsid wrapper, not the bridge itself. Confirmed
+  ;; directly: spawning `setsid sleep 5` via SB-EXT:RUN-PROGRAM reported
+  ;; one PID while the real, running `sleep` process had the PID right
+  ;; after it. The bridge recording its own, unambiguous
+  ;; (SB-UNIX:UNIX-GETPID) removes any launcher's dependence on
+  ;; correctly guessing this across an execve chain at all -- whatever
+  ;; a launcher wrote as a placeholder (if anything) is simply
+  ;; overwritten with the authoritative value moments later, and every
+  ;; PID-file reader (sbcl-bridge-ctl.sh's is_running, this file's own
+  ;; RESUME-BRIDGE via ctl.sh, or a Lisp caller) already re-reads the
+  ;; file fresh each time rather than caching an earlier guess, so this
+  ;; correction is automatically picked up with no other changes
+  ;; needed anywhere. Best-effort and non-fatal: a launcher that reads
+  ;; this file moments too early still has ITS OWN placeholder (if any)
+  ;; to fall back on, and if writing this fails for some reason (a
+  ;; read-only directory, say), the bridge still starts -- it just
+  ;; means whoever launched it needs to have gotten the PID right
+  ;; itself, exactly as before this existed.
+  ;;
+  ;; This is no longer a plain, unconditional overwrite, though -- see
+  ;; CLAIM-PID-FILE, below, which additionally refuses to start
+  ;; altogether if the existing PID file names another live process
+  ;; that's confirmed (via /proc/<pid>/environ) to already be a bridge
+  ;; watching this same directory. Two bridges racing to claim the same
+  ;; request queue is a real failure mode this closes, not a
+  ;; hypothetical one.
+  (setf *bridge-main-thread* sb-thread:*current-thread*)
+  (install-debugger-hook)
+  (let ((early-dir (ensure-directory-pathname directory)))
+    (claim-pid-file (merge-pathnames ".sbcl-bridge.pid" early-dir) early-dir))
   (setf *bridge-directory* directory)
   (setf *bridge-poll-interval* poll-interval)
   (setf *bridge-default-timeout* default-timeout)
   (setf *bridge-backtrace-frames* backtrace-frames)
-  (install-debugger-hook)
   (let* ((dir (ensure-directory-pathname directory))
          (input-path (merge-pathnames input-name dir))
          (working-path (merge-pathnames working-name dir))
@@ -1116,6 +1496,7 @@ Does not return under normal operation."
          (archive-dir (merge-pathnames
                        (make-pathname :directory (list :relative archive-subdir))
                        dir)))
+    (setf *async-error-log-path* (merge-pathnames async-error-log-name dir))
     (ensure-directories-exist archive-dir)
     ;; Recorded so suspend-bridge can archive its own request file
     ;; right before save-lisp-and-die (see archive-own-request).
@@ -1132,10 +1513,13 @@ Does not return under normal operation."
                    (merge-pathnames
                     (format nil "leftover-~a.lisp" (get-universal-time))
                     archive-dir)))
-    ;; Clear out any stale cancel-request left over from before a
-    ;; restart -- it should never apply to a newly (re)started bridge.
-    (let ((cancel-path (merge-pathnames *cancel-file-name* dir)))
-      (when (probe-file cancel-path) (ignore-errors (delete-file cancel-path))))
+    ;; Clear out any stale cancel-request/stop-request left over from
+    ;; before a restart -- neither should ever apply to a newly
+    ;; (re)started bridge.
+    (let ((cancel-path (merge-pathnames *cancel-file-name* dir))
+          (stop-path (merge-pathnames *stop-file-name* dir)))
+      (when (probe-file cancel-path) (ignore-errors (delete-file cancel-path)))
+      (when (probe-file stop-path) (ignore-errors (delete-file stop-path))))
     #+sb-thread
     (let ((main-thread sb-thread:*current-thread*))
       (setf *watchdog-thread*
@@ -1266,8 +1650,8 @@ nothing about the environment had actually changed."
                (not (paths-equal-p dir-override *bridge-directory*)))
       (with-output-lock
         (format t "~&;;; RESUME: SBCL_BRIDGE_DIR=~a overrides the directory saved in this ~
-image (~a)~%"
-                dir-override *bridge-directory*)
+image (~a) ts=~a~%"
+                dir-override *bridge-directory* (get-universal-time))
         (finish-output))
       (setf *bridge-directory* dir-override)))
   (run-bridge :directory *bridge-directory*
@@ -1305,6 +1689,21 @@ into SBCL_HOME by sbcl-bridge-ctl.sh's resume command."
                               (or (ignore-errors (truename home)) home))))
               (if home (namestring home) "")))))
 
+(defun pinned-marker-path (core-path)
+  (concatenate 'string (namestring core-path) ".pinned"))
+
+(defun write-pinned-marker (core-path name)
+  "Records NAME next to CORE-PATH, marking it as a named/pinned core --
+see suspend-bridge's :NAME argument. Presence of this sidecar (checked
+by sbcl-bridge-ctl.sh's prune_cores) is what exempts a core from
+SBCL_CORE_RETAIN's automatic pruning; it's deletable only explicitly,
+via `ctl.sh delete-core`."
+  (with-open-file (s (pinned-marker-path core-path)
+                      :direction :output
+                      :if-exists :supersede
+                      :if-does-not-exist :create)
+    (write-string name s)))
+
 (defun archive-own-request ()
   "Archive the currently-claimed request file (if any) into processed/
 under its own reqid, exactly as run-bridge would have done after the
@@ -1326,12 +1725,16 @@ suspend."
                                 (sanitize-reqid-for-filename reqid))
                         *bridge-archive-dir*)))))))
 
-(defun suspend-bridge (&key (core-path (error "core-path required")))
+(defun suspend-bridge (&key (core-path (error "core-path required")) name)
   "Save an executable image capturing all current state to CORE-PATH,
 then terminate this process. Intended to be called as (part of) a
 normal request submitted through the usual next-sbcl-input.lisp
 mechanism. Running the saved image later (just executing the file)
 resumes the polling loop on the same directory via resume-bridge.
+
+NAME, if given, marks this core as pinned (see WRITE-PINNED-MARKER) --
+sbcl-bridge-ctl.sh's suspend/delete-core commands use this to exempt a
+named core from SBCL_CORE_RETAIN's automatic pruning.
 
 IMPORTANT: a resumed executable image does not know where SBCL's
 contrib modules (sb-rotate-byte, sb-posix, sb-bsd-sockets, etc.) live
@@ -1369,7 +1772,7 @@ needs to be found on disk again after a resume."
   ;; string elsewhere would not have.
   (let ((core-path (pathname core-path)))
     (with-output-lock
-      (format t "~&;;; SUSPENDING to ~a~%" core-path)
+      (format t "~&;;; SUSPENDING to ~a ts=~a~%" core-path (get-universal-time))
       (finish-output))
     ;; save-lisp-and-die refuses to run with other threads alive.
     #+sb-thread
@@ -1378,6 +1781,7 @@ needs to be found on disk again after a resume."
       (ignore-errors (sb-thread:join-thread *watchdog-thread* :timeout 5 :default nil))
       (setf *watchdog-thread* nil))
     (write-version-sidecar core-path)
+    (when name (write-pinned-marker core-path name))
     ;; Archive this request's own claimed file (next-sbcl-input.working)
     ;; under its reqid now: save-lisp-and-die never returns, so
     ;; run-bridge's usual post-request archive rename will never run for
@@ -1391,7 +1795,26 @@ needs to be found on disk again after a resume."
     ;; nothing conflicts.
     (archive-own-request)
     (sb-ext:gc :full t)
-    (sb-ext:save-lisp-and-die core-path
-                              :toplevel #'resume-bridge
-                              :executable t
-                              :save-runtime-options t)))
+    (handler-case
+        (sb-ext:save-lisp-and-die core-path
+                                  :toplevel #'resume-bridge
+                                  :executable t
+                                  :save-runtime-options t)
+      (error (c)
+        ;; save-lisp-and-die refuses outright if any thread besides this
+        ;; one is still alive. That failure mode is more likely to come
+        ;; up in practice now than it used to be: making a background
+        ;; thread's own fault survivable (see the debugger-hook section,
+        ;; above) means a LIVE, non-faulted thread evaluated code itself
+        ;; spawned -- a web server started as a background service, say
+        ;; -- is more likely to still be running at the moment someone
+        ;; suspends. Report which threads, by name, so the failure is
+        ;; actionable instead of an opaque SBCL internal error; the
+        ;; watchdog is already stopped by this point (above), so
+        ;; whatever remains here is exactly what needs to be shut down
+        ;; before suspending will work.
+        (let ((others (remove sb-thread:*current-thread* (sb-thread:list-all-threads))))
+          (error "~a~@[ -- other live thread(s) still running: ~{~a~^, ~}~]"
+                 c
+                 (and others
+                      (mapcar (lambda (th) (or (sb-thread:thread-name th) "unnamed")) others))))))))

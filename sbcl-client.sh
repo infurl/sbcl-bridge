@@ -333,6 +333,12 @@ while true; do
     ' <<<"$NEW_CONTENT"
 
     STATUS_LINE="$(grep -F "$END_MARK" <<<"$NEW_CONTENT" | tail -n1)"
+    # Courtesy timing/memory line -- stderr only, never stdout, so it
+    # can never pollute output a caller might be capturing/parsing.
+    # Absent gracefully (no output at all) when talking to an older
+    # bridge whose END-OUTPUT marker doesn't carry these fields yet.
+    STATS="$(grep -oE 'elapsed-ms=[0-9]+ consed-bytes=[0-9]+' <<<"$STATUS_LINE" || true)"
+    [ -n "$STATS" ] && echo "stats: $STATS" >&2
     case "$STATUS_LINE" in
       *status=ok*)              exit 0 ;;
       *status=error*)           exit 1 ;;

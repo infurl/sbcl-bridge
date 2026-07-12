@@ -5,7 +5,7 @@ Common Lisp) process from an external tool — typically a coding agent —
 without the debugging-protocol chatter that Swank adds.
 
 This document consolidates everything you need to understand, run, and operate
-the system. It covers four files:
+the system. It covers five files:
 
 - `sbcl-bridge.lisp`
   - The Lisp code that runs *inside* the persistent SBCL process.
@@ -15,6 +15,12 @@ the system. It covers four files:
 
 - `sbcl-client.sh`
   - Client: submit code to a running bridge and wait for the result.
+
+- `sbcl-client.lisp`
+  - A pure Common Lisp reimplementation of the two scripts above, for driving
+    a bridge from *another* running SBCL image instead of the shell. Speaks
+    the same on-disk protocol; maintained in parallel, not a replacement —
+    see §12.
 
 - `sbcl-bridge-test.sh`
   - End-to-end smoke test: spins up a throwaway bridge in a temp directory and
@@ -1491,16 +1497,7 @@ Two things differ from the `XDG_CACHE_HOME` case, both worth knowing:
   useful) question than comparing configuration strings. So this bridge keeps
   its own record, `*synced-cl-source-registry*`, of the raw environment string
   last synced against — preserved across suspend/resume like everything else
-  baked into the image. That comparison is a plain string `equal`,
-  deliberately not `paths-equal-p` (§8.4's truename-based comparison) — and
-  not just because `paths-equal-p` requires the path to exist, the reason it
-  was wrong for §8.8's cache directory. Here it would be wrong on its own
-  terms: `CL_SOURCE_REGISTRY`'s own syntax gives a single trailing slash and a
-  double trailing slash different meanings (`:directory` versus `:tree` — see
-  the quick-reference callout in §11), so resolving `/foo/` and `/foo//` down
-  to the same canonical path, the way `truename` would, would erase a
-  distinction ASDF itself treats as meaningful, not merely normalize away an
-  incidental spelling difference.
+  baked into the image.
 
 - **That record is deliberately updated regardless of whether ASDF happens to
   be loaded yet.** This one was a real bug caught before shipping, not just a
@@ -1567,12 +1564,36 @@ Worth internalizing before you rely on this in production:
 - **Cancellation needs a safepoint.** Code stuck inside a blocking foreign
   call won't respond to `interrupt` (see §8.2).
 
-- **Backtrace filtering uses unexported SBCL internals**
-  (`sb-debug::map-backtrace`, `sb-debug::print-frame-call`). They work on the
-  SBCL version this was built and tested against, but aren't part of SBCL's
-  stable public API. There's an automatic fallback to the unfiltered public
-  API if they ever go away — run `./sbcl-bridge-test.sh` after any SBCL
-  upgrade to verify this (and everything else) in one go.
+- **Backtraces come from `sb-debug:print-backtrace`**, a stable, exported SBCL
+  API. An earlier version of this codebase instead hand-walked frames via the
+  unexported `sb-debug::map-backtrace`/`sb-debug::print-frame-call`, filtering
+  out bridge-internal frames by searching each one's printed text for the
+  substring `"SBCL-BRIDGE"` — that approach was retired after being found,
+  empirically, to silently produce an *empty* backtrace whenever this file was
+  loaded whole via `--load` (i.e. on every normal bridge startup), while the
+  identical code worked fine compiled standalone. Root cause not tracked down
+  (some interaction between whole-file compilation and `map-backtrace`'s own
+  stack walk); `print-backtrace` was simply confirmed to work correctly in
+  exactly the case that was failing, and is simpler besides — its own `:count`
+  already bounds output length, and the retired substring filter never
+  actually matched anything in the first place (`print-frame-call` renders
+  frame text without package qualification, so `"SBCL-BRIDGE"` could never
+  appear in it).
+
+- **Cross-thread backtraces (`sbcl-async-errors.log`) only catch conditions
+  that reach the top of a thread's stack genuinely unhandled.** If code you
+  submit spawns a thread using a library that installs its own top-level error
+  handling (Hunchentoot's request-handler threads, with
+  `*show-lisp-errors-p*`, are the example that motivated this feature), that
+  library's own handler runs first and the condition never reaches the
+  bridge's hook — you won't see an entry here for it. This is a generic
+  backstop for threads with *no* handler of their own (a bare
+  `sb-thread:make-thread` that doesn't catch its own errors), not a universal
+  interceptor. An unhandled condition on the bridge's own main thread is
+  unaffected by any of this and remains fatal to the whole process, exactly as
+  before this feature existed — killing the entire bridge over one unrelated
+  background thread's fault would be a regression, so that distinction is made
+  by thread identity, not disabled.
 
 - **Copytruncate race window** (§8.5): a write landing in the instant between
   copy and truncate can theoretically be lost. Rotation is skipped entirely
@@ -1604,13 +1625,34 @@ Worth internalizing before you rely on this in production:
   incidentally, but a completely dormant bridge with nobody checking on it
   will not clean up after itself.
 
-- **PID-file identity check is a heuristic.** `status`/`stop` verify the
+- **PID-file identity check is a heuristic for `status`/`stop`'s purposes,
+  stronger but still not airtight at startup.** `status`/`stop` verify the
   recorded PID looks like the bridge (command line matching `sbcl` or
-  `*.core`), which defeats ordinary PID recycling, but it can't positively
-  prove the process is *this* bridge — an unrelated sbcl process that happened
-  to recycle the PID would still pass. If you resume from a custom core path,
-  keep the `.core` suffix so the check recognizes it; on systems without
-  `/proc`, the check degrades to a bare `kill -0`.
+  `*.core`), which defeats ordinary PID recycling for their purposes, but
+  can't positively prove the process is *this* bridge; on systems without
+  `/proc`, it degrades to a bare `kill -0`. `run-bridge` itself uses a
+  stronger check at startup — before claiming (or refusing to claim) an
+  existing PID file, it reads `/proc/<pid>/environ` and compares
+  `SBCL_BRIDGE_DIR` directly, which correctly distinguishes "another live
+  bridge watching this same directory" (refuse to start) from "a recycled PID
+  belonging to something unrelated" (clean up and proceed) — falling back to
+  the weaker cmdline heuristic only if `/proc/<pid>/environ` itself is
+  unreadable. If you resume from a custom core path, keep the `.core` suffix
+  so both checks recognize it.
+
+- **The startup duplicate-bridge guard narrows the launch race, it doesn't
+  eliminate it.** Two processes racing to start a bridge against the same
+  directory can each still get as far as spawning a full SBCL process before
+  either reaches the PID-file claim inside `run-bridge` — the loser
+  self-terminates within its first startup instead of running forever (which
+  is the actual failure mode this closes: two bridges both polling the same
+  request queue indefinitely), but a brief double-spawn window remains before
+  that resolves. A fully rigorous fix would need a lifetime-held OS-level lock
+  (`flock` via `sb-posix`), which conflicts with `sbcl-bridge.lisp`'s
+  deliberate zero-contrib-dependency design (see §5's discussion of why it
+  uses `sb-unix:unix-getpid` instead of `sb-posix:getpid`) — judged not worth
+  trading away for this, since the narrowed race is already far cheaper to hit
+  than the original unbounded one.
 
 - **A fresh Quicklisp install needs real network access to
   `beta.quicklisp.org`** (§8.7). This is only reached as a last resort — if
@@ -1815,24 +1857,28 @@ Worth internalizing before you rely on this in production:
 # Setup (once per shell)
 export SBCL_BRIDGE_DIR=/path/to/bridge
 export SBCL_BRIDGE_LISP=/path/to/sbcl-bridge.lisp
-export QUICKLISP_HOME=/path/to/quicklisp            # optional; see §8.7
-export XDG_CACHE_HOME=/path/to/cache                # optional; see §8.8
-export CL_SOURCE_REGISTRY=/path/to/systems//        # optional; see §8.9
+export QUICKLISP_HOME=/path/to/quicklisp        # optional; see §8.7
+export XDG_CACHE_HOME=/path/to/cache            # optional; see §8.8
+export CL_SOURCE_REGISTRY=/path/to/systems//    # optional; see §8.9
 
 # Lifecycle
 ./sbcl-bridge-ctl.sh start
 ./sbcl-bridge-ctl.sh status
-./sbcl-bridge-ctl.sh stop
-./sbcl-bridge-ctl.sh restart
+./sbcl-bridge-ctl.sh stop [--force]     # graceful (cancel, then in-Lisp exit) unless --force
+./sbcl-bridge-ctl.sh restart            # stop + FRESH start (no saved state)
+./sbcl-bridge-ctl.sh refresh            # stop + resume from cores/current.core
 
-# Suspend / resume
-./sbcl-bridge-ctl.sh suspend [core-path]
-./sbcl-bridge-ctl.sh resume  [core-path]
+# Suspend / resume / named cores
+./sbcl-bridge-ctl.sh suspend [core-path] [--name NAME]   # --name pins it (exempt from pruning)
+./sbcl-bridge-ctl.sh resume  [core-path-or-name]
+./sbcl-bridge-ctl.sh delete-core <name-or-path> [--force] # the only way to remove a pinned core
 
 # Cancel whatever's running
 ./sbcl-bridge-ctl.sh interrupt [reqid]
 
-# Logs
+# Logs (sbcl-output.log, sbcl-input.log, sbcl-async-errors.log -- the third
+# records unhandled conditions from threads OTHER than the bridge's own main
+# one, e.g. one a web server you started spawned; see §9)
 ./sbcl-bridge-ctl.sh logs [-f] [lines]
 ./sbcl-bridge-ctl.sh rotate-logs [--force]
 
@@ -1871,3 +1917,85 @@ Client exit codes (§7 has the full contract):
 - **5** — fatal non-error condition
 - **6** — usage / preflight error — never submitted, fix your setup
 - **7** — couldn't submit within `SBCL_TIMEOUT` — bridge just busy, retry
+
+---
+
+## 12. `sbcl-client.lisp` — pure Lisp client/control library
+
+A pure Common Lisp reimplementation of `sbcl-bridge-ctl.sh` and
+`sbcl-client.sh`, for driving a bridge from *another* running SBCL image
+instead of the shell — an agent that's already inside a Lisp REPL, or
+orchestration code that would rather call functions and handle conditions than
+parse shell exit codes. It speaks the exact same on-disk protocol those
+scripts do: a bridge started with `sbcl-bridge-ctl.sh` can be controlled from
+here, and a bridge started from here can be controlled with
+`sbcl-bridge-ctl.sh` — neither side knows or cares which started it. This is
+maintained *in parallel* with the shell scripts, not a replacement for them;
+use whichever fits the calling context.
+
+```lisp
+(load "sbcl-client.lisp")
+(sbcl-bridge-client:bridge-start :directory "/tmp/my-bridge")
+(sbcl-bridge-client:bridge-eval "(+ 1 2)")
+;; => "3"
+(sbcl-bridge-client:bridge-suspend)
+(sbcl-bridge-client:bridge-resume)
+(sbcl-bridge-client:bridge-stop)
+```
+
+Configuration mirrors the shell scripts' environment variables exactly —
+`*bridge-dir*` reads `SBCL_BRIDGE_DIR`, `*poll-interval*` reads
+`SBCL_POLL_INTERVAL`, and so on — so an environment already set up for the
+shell tools configures this library identically with no extra setup. Every
+function also accepts a `:directory` (and other relevant) keyword to override
+the ambient default for one call.
+
+**Current scope:** every `sbcl-bridge-ctl.sh` command (`start`, `stop`,
+`restart`, `status`, `suspend`, `resume`, `interrupt`, `rotate-logs`, `logs`)
+and `sbcl-client.sh`'s submission protocol (header parsing, atomic queue-safe
+submission, response correlation, the full precedence rules for `TIMEOUT`),
+each as an ordinary function. Where the shell client distinguishes outcomes by
+exit code, this library signals a condition — `bridge-evaluation-error`,
+`bridge-request-timeout-error`, `bridge-cancelled-error`, and so on, all
+subclasses of `bridge-error` — with the reqid and raw response text attached
+to the condition, or, with `bridge-eval`'s `:signal-errors nil`, returned as
+extra values instead for callers who'd rather branch on a status keyword than
+handle conditions.  **Not yet ported:** `sbcl-bridge-test.sh`'s 44-check smoke
+suite — a large, mostly mechanical translation, deliberately left for a
+follow-up once this library's own API has had a chance to prove out, rather
+than porting tests against an API that might still move.
+
+Every function in this library was verified against a *real* running bridge,
+not just loaded and assumed correct — including proving interoperability in
+both directions: a bridge started with `sbcl-bridge-ctl.sh` was suspended,
+resumed, evaluated against, and interrupted from this library, and a bridge
+started from this library was equally readable and controllable from
+`sbcl-bridge-ctl.sh`/`sbcl-client.sh`, across several alternating hops. That
+process caught two real, non-obvious bugs worth knowing about if you're
+extending this file:
+
+- **`setsid CMD` does not always preserve `CMD`'s PID across the exec.**
+  `setsid(2)` requires its caller not already be a process group leader; when
+  it *is* — which, confirmed directly, depends on how the immediate parent set
+  up the child before exec (`SB-EXT:RUN-PROGRAM`'s child setup triggers this;
+  a plain shell background job typically does not) — the `setsid` *utility*
+  silently forks a new child to work around that restriction rather than
+  exec-ing in place, so a PID captured from the call that invoked `setsid`
+  (bash's `$!`, or `SB-EXT:PROCESS-PID`) can end up naming the now-exited
+  wrapper, not the bridge. The fix is architectural, not local to this file:
+  `sbcl-bridge.lisp`'s `run-bridge` now writes its own PID file as its first
+  action, before anything else, so no launcher — shell or Lisp — needs to
+  correctly guess its PID across an `execve` chain at all. This benefits
+  `sbcl-bridge-ctl.sh` too, even though bash's own `$!` was confirmed *not*
+  actually affected by this in testing.
+
+- **`CL:RENAME-FILE`'s second argument merges against the first argument's
+  pathname components for anything it doesn't explicitly specify** — the exact
+  same class of trap `ensure-directory-pathname` documents at length for
+  `MERGE-PATHNAMES` generally (§8.4 in `sbcl-bridge.lisp`), independently
+  rediscovered here: renaming a `.tmp` file to a bare `cancel-request` (no
+  dot, so it parses with a `NIL` type) silently renamed it to
+  `cancel-request.tmp` instead, since the `NIL` type was treated as
+  unspecified and inherited the source's `.tmp`. `sb-posix:rename` on plain
+  namestrings sidesteps CL pathname-merging semantics entirely, the same way
+  `sb-posix:link` already does for atomic submission.

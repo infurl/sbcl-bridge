@@ -819,7 +819,16 @@ fi
 # watching (and writing logs into) the wrong place with no error.
 "$CLIENT" eval '(defparameter *moved-marker* :still-here)' >/dev/null 2>&1
 "$CTL" suspend >/dev/null 2>&1
-MOVED_CORE="$(ls -t "$SBCL_BRIDGE_DIR"/cores/*.core 2>/dev/null | head -1)"
+# Exclude cores/current.core itself: that's a pointer TO the just-saved
+# core (see UPDATE_CURRENT_CORE_SYMLINK in sbcl-bridge-ctl.sh), not a
+# core image of its own -- `ls -t` sorting by mtime would otherwise
+# often put it first (a symlink's own mtime updates whenever it's
+# re-pointed), and `cp` preserves the SYMLINK'S name, not its target's,
+# so the copy below would land as "current.core" in $MOVED_DIR/cores/ --
+# a name cmd_resume's own core selection deliberately treats as "not a
+# real core" and refuses to pick, exactly the same way ctl.sh's own
+# list_cores_by_age does.
+MOVED_CORE="$(ls -t "$SBCL_BRIDGE_DIR"/cores/*.core 2>/dev/null | grep -v '/current\.core$' | head -1)"
 MOVED_DIR="$(mktemp -d)"
 if [ -n "$MOVED_CORE" ]; then
   mkdir -p "$MOVED_DIR/cores"
